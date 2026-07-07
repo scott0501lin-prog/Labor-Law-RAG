@@ -1,0 +1,24 @@
+# 敏感資訊
+.env
+
+# 資料庫（本地產生，不需上傳）
+*.db
+backend/law_db/
+backend/embeddings/
+chat_histories/
+
+# Python 快取
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 虛擬環境
+venv/
+.venv/
+env/
+
+# 系統檔
+.DS_Store
+desktop.ini
+Thumbs.db

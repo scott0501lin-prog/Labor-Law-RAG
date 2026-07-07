@@ -6,8 +6,7 @@ from dotenv import load_dotenv
 from db import init_indexes, register_user, verify_user, save_chat, list_chats, load_chat
 from translate import translate, LANGUAGES
 
-# ← 把你的 Gemini API Key 貼在這裡的引號內
-GEMINI_API_KEY = "AIzaSyBTnT9W_N9gTuFIud9BObUKmbo3GCLUUsA"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(base_dir, ".env"))

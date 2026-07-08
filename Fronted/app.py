@@ -76,7 +76,7 @@ def query_rag_system(user_prompt: str, system_prompt: str) -> str:
 
         api_key = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
         if not api_key:
-            return "🚨 找不到 GEMINI_API_KEY，請在 app.py 第 9 行填入金鑰。"
+            return "🚨 找不到 GEMINI_API_KEY，請在 .env 中設定。"
 
         genai.configure(api_key=api_key)
         model, law_emb, law_texts, law_metas, case_emb, case_texts, case_metas = _load_index()

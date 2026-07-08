@@ -80,24 +80,37 @@ def verify_user(username: str, password: str) -> tuple[bool, str]:
 # 歷史對話模組
 # 一筆文件 = 一個對話串 (chat)，以 username + chat_id 為鍵
 # ==========================================
+def _make_title(messages: list[dict], max_len: int = 18) -> str | None:
+    """取第一則使用者訊息的前 max_len 個字當作對話標題。"""
+    for m in messages:
+        if m["role"] == "user":
+            text = m["content"].strip().replace("\n", " ")
+            return text if len(text) <= max_len else text[:max_len] + "…"
+    return None
+
+
 def save_chat(username: str, chat_id: str, messages: list[dict]):
     db = get_db()
+    set_on_insert = {"created_at": datetime.now(timezone.utc)}
+    title = _make_title(messages)
+    if title:
+        set_on_insert["title"] = title
     db.chat_histories.update_one(
         {"username": username, "chat_id": chat_id},
         {
             "$set": {"messages": messages, "updated_at": datetime.now(timezone.utc)},
-            "$setOnInsert": {"created_at": datetime.now(timezone.utc)},
+            "$setOnInsert": set_on_insert,
         },
         upsert=True,
     )
 
 
 def list_chats(username: str) -> list[dict]:
-    """回傳該使用者所有對話的摘要（chat_id, updated_at），最新的在前。"""
+    """回傳該使用者所有對話的摘要（chat_id, title, updated_at），最新的在前。"""
     db = get_db()
     cursor = db.chat_histories.find(
         {"username": username},
-        {"chat_id": 1, "updated_at": 1, "_id": 0},
+        {"chat_id": 1, "title": 1, "updated_at": 1, "_id": 0},
     ).sort("updated_at", -1)
     return list(cursor)
 

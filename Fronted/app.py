@@ -1,16 +1,17 @@
 import streamlit as st
 import os
 import uuid
+from datetime import timezone
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from db import init_indexes, register_user, verify_user, save_chat, list_chats, load_chat
 from translate import translate, LANGUAGES
 
-# ← 把你的 Gemini API Key 貼在這裡的引號內
-GEMINI_API_KEY = "AIzaSyBTnT9W_N9gTuFIud9BObUKmbo3GCLUUsA"
-
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(base_dir, ".env"))
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 
 # ==========================================
@@ -286,9 +287,12 @@ def show_chat_room():
             st.info("無紀錄")
         else:
             for chat in saved_chats:
-                cid   = chat["chat_id"]
-                label = chat["updated_at"].strftime("%m/%d %H:%M")
-                if st.button(label, key=cid, use_container_width=True):
+                cid = chat["chat_id"]
+                updated_at = chat["updated_at"].replace(tzinfo=timezone.utc)
+                local_time = updated_at.astimezone(ZoneInfo("Asia/Taipei"))
+                time_str = local_time.strftime("%m/%d %H:%M")
+                label = chat.get("title") or time_str
+                if st.button(label, key=cid, help=time_str, use_container_width=True):
                     st.session_state.messages        = load_chat(st.session_state.username, cid)
                     st.session_state.current_chat_id = cid
                     st.rerun()

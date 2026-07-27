@@ -4,7 +4,6 @@
 # 資料庫（本地產生，不需上傳）
 *.db
 backend/law_db/
-backend/embeddings/
 chat_histories/
 
 # Python 快取

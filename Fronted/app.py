@@ -73,6 +73,14 @@ def _search(model, query, embeddings, texts, metas, top_k=3):
 
 # 加班費是最常被問、也最容易被 embedding 檢索漏掉的主題（問句越長、細節越多，
 # 排名越不穩定）。偵測到這些關鍵字時，強制把核心條文塞進結果，不依賴 embedding 排名。
+#
+# 「換補休」類提問實際對應的法條是第 32-1 條（補休轉換規則），跟第 24/32/36 條
+# （加班費倍率、工時上限、休息日）關聯度較低；若混在同一組關鍵字裡，會對換補休
+# 問題硬塞不對題的加班費條文。因此拆成兩組、依優先序互斥處理：換補休類優先比對，
+# 命中就只保底第 32-1 條；否則才落回一般加班費/工時類的保底。
+COMP_LEAVE_KEYWORDS = ["補休", "換休", "以休代薪", "代替休假"]
+COMP_LEAVE_FORCE_ARTICLES = {"第 32-1 條"}
+
 OVERTIME_KEYWORDS = ["加班", "延長工作時間", "延長工時", "休息日工作", "例假工作", "假日加班"]
 OVERTIME_FORCE_ARTICLES = {"第 24 條", "第 32 條", "第 36 條"}
 
@@ -116,9 +124,14 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
                 search_query = user_prompt
 
         l_results = _search(model, search_query, law_emb,  law_texts,  law_metas,  top_k=5)
-        l_results = _force_include_articles(
-            search_query, l_results, law_texts, law_metas, OVERTIME_KEYWORDS, OVERTIME_FORCE_ARTICLES
-        )
+        if any(k in search_query for k in COMP_LEAVE_KEYWORDS):
+            l_results = _force_include_articles(
+                search_query, l_results, law_texts, law_metas, COMP_LEAVE_KEYWORDS, COMP_LEAVE_FORCE_ARTICLES
+            )
+        else:
+            l_results = _force_include_articles(
+                search_query, l_results, law_texts, law_metas, OVERTIME_KEYWORDS, OVERTIME_FORCE_ARTICLES
+            )
         c_results = _search(model, search_query, case_emb, case_texts, case_metas, top_k=5)
 
         law_ctx = ""

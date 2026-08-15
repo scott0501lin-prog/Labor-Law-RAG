@@ -43,11 +43,11 @@ if __name__ == "__main__":
     print(f"載入模型：{MODEL_NAME}")
     model = SentenceTransformer(MODEL_NAME)
 
-    # ── 勞基法條文 ───────────────────────────────
-    print("\n[1/2] 勞基法條文")
-    laws  = load_json("labor_law_cleaned.json")
+    # ── 勞基法本法 + 施行細則條文 ───────────────────────────────
+    print("\n[1/2] 勞基法本法 + 施行細則條文")
+    laws  = load_json("labor_law_cleaned.json") + load_json("labor_law_rules_cleaned.json")
     texts = [item.get("text", "")[:MAX_LEN] for item in laws]
-    metas = [{"article_no": item.get("article_no", ""), "source": "勞動基準法"} for item in laws]
+    metas = [{"article_no": item.get("article_no", ""), "source": item.get("source", "勞動基準法")} for item in laws]
     encode_and_save(model, texts, metas, "law")
 
     # ── 案例 / Q&A / 裁判書 ──────────────────────

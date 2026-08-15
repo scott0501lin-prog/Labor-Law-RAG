@@ -85,14 +85,19 @@ OVERTIME_KEYWORDS = ["加班", "延長工作時間", "延長工時", "休息日�
 OVERTIME_FORCE_ARTICLES = {"第 24 條", "第 32 條", "第 36 條"}
 
 
-def _force_include_articles(query, results, texts, metas, keywords, force_article_nos):
+def _force_include_articles(query, results, texts, metas, keywords, force_article_nos, source="勞動基準法"):
+    # 法條索引現在同時混了勞基法本法與施行細則，兩者的 article_no 可能撞號
+    # （例如兩邊都各自有自己的「第 24 條」），所以強制帶入時一定要限定
+    # source，否則可能誤把施行細則裡不相關的同號條文塞進來。
     if not any(k in query for k in keywords):
         return results
     existing = {m.get("article_no") for _, m, _ in results}
     forced = [
         (texts[i], m, None)
         for i, m in enumerate(metas)
-        if m.get("article_no") in force_article_nos and m.get("article_no") not in existing
+        if m.get("article_no") in force_article_nos
+        and m.get("article_no") not in existing
+        and m.get("source") == source
     ]
     return forced + results
 
@@ -136,7 +141,7 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
 
         law_ctx = ""
         for d, m, _ in l_results:
-            law_ctx += f"【法規內容】：{d}\n【條號】：{m.get('article_no', '')}\n\n"
+            law_ctx += f"【法規內容】：{d}\n【條號】：{m.get('source', '')} {m.get('article_no', '')}\n\n"
 
         case_ctx = ""
         for d, m, _ in c_results:

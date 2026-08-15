@@ -1,9 +1,9 @@
 """
-勞動基準法爬蟲
+勞動基準法施行細則爬蟲
 資料來源：全國法規資料庫 (law.moj.gov.tw)
-輸出：
-  - backend/labor_law.json   （原始條文 JSON）
-  - backend/law_db/           （ChromaDB，供 RAG 使用）
+輸出（獨立檔案，不會動到既有的 labor_law_cleaned.json）：
+  - backend/labor_law_rules.json          （原始條文 JSON，格式同 labor_law.json）
+  - backend/labor_law_rules_cleaned.json  （embedding 用格式，同 labor_law_cleaned.json）
 """
 
 import json
@@ -11,7 +11,6 @@ import os
 import re
 import ssl
 import sys
-import time
 import requests
 from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
@@ -20,8 +19,8 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PCODE    = "N0030001"   # 勞動基準法
-LAW_NAME = "勞動基準法"
+PCODE    = "N0030002"   # 勞動基準法施行細則
+LAW_NAME = "勞動基準法施行細則"
 LAW_URL  = f"https://law.moj.gov.tw/LawClass/LawAll.aspx?pcode={PCODE}"
 
 HEADERS = {
@@ -32,12 +31,6 @@ HEADERS = {
     ),
     "Accept-Language": "zh-TW,zh;q=0.9",
 }
-
-# 條號可能帶「之X」附條，MOJ 網站本身以連字號呈現（例如「第 9-1 條」），
-# 舊版用 re.search(r"\d+", ...) 只抓得到「9」，會跟正牌第9條的 article_no
-# 撞號（labor_law.json 裡兩筆都標記為「第 9 條」的問題即源自於此）。
-ARTICLE_NO_RE = re.compile(r"第\s*(\d+(?:-\d+)?)\s*條")
-FLNO_RE       = re.compile(r"[?&]flno=([^&]+)")
 
 
 class _RelaxedX509Adapter(HTTPAdapter):
@@ -58,17 +51,11 @@ def _make_session() -> requests.Session:
     session.mount("https://", _RelaxedX509Adapter())
     return session
 
-
-def _extract_no(no_cell) -> str | None:
-    """優先從連結網址的 flno 參數取條號（MOJ 官方編號，含連字號最準），
-    抓不到再退回比對條號文字。"""
-    link = no_cell.select_one("a[href*='flno=']")
-    if link:
-        m = FLNO_RE.search(link.get("href", ""))
-        if m:
-            return m.group(1)
-    m = ARTICLE_NO_RE.search(no_cell.get_text(strip=True))
-    return m.group(1) if m else None
+# 條號可能帶「之X」附條，MOJ 網站本身以連字號呈現（例如「第 7-1 條」），
+# 舊版 scraper_labor_law.py 用 re.search(r"\d+", ...) 只抓得到「7」，
+# 會跟正牌第7條的 article_no 撞號，這裡改用完整比對含連字號的條號。
+ARTICLE_NO_RE = re.compile(r"第\s*(\d+(?:-\d+)?)\s*條")
+FLNO_RE       = re.compile(r"[?&]flno=([^&]+)")
 
 
 # ==========================================
@@ -80,6 +67,18 @@ def fetch_html(url: str) -> BeautifulSoup:
     resp.raise_for_status()
     resp.encoding = "utf-8"
     return BeautifulSoup(resp.text, "html.parser")
+
+
+def _extract_no(no_cell) -> str | None:
+    """優先從連結網址的 flno 參數取條號（MOJ 官方編號，含連字號最準），
+    抓不到再退回比對條號文字。"""
+    link = no_cell.select_one("a[href*='flno=']")
+    if link:
+        m = FLNO_RE.search(link.get("href", ""))
+        if m:
+            return m.group(1)
+    m = ARTICLE_NO_RE.search(no_cell.get_text(strip=True))
+    return m.group(1) if m else None
 
 
 # ==========================================
@@ -129,20 +128,17 @@ def parse_table_structure(soup: BeautifulSoup) -> list[dict]:
 
 # ==========================================
 # 2c. 策略三：純文字 + regex（最後防線）
-#     抓「第 X 條」後的所有文字直到下一條
+#     抓「第 X 條」或「第 X-Y 條」後的所有文字直到下一條
 # ==========================================
 def parse_text_fallback(soup: BeautifulSoup) -> list[dict]:
-    # 移除不必要的區塊
     for tag in soup(["script", "style", "nav", "header", "footer", "noscript"]):
         tag.decompose()
 
     text = soup.get_text("\n")
-
-    # 分割：以「第 數字 條」或「第 數字-數字 條」為分界（MOJ 網站附條用連字號呈現）
     parts = re.split(r"(第\s*\d+(?:-\d+)?\s*條)", text)
 
     articles = []
-    i = 1                           # parts[0] 是條文前的頁首雜訊
+    i = 1
     while i < len(parts) - 1:
         header  = parts[i]
         content = parts[i + 1] if i + 1 < len(parts) else ""
@@ -153,12 +149,10 @@ def parse_text_fallback(soup: BeautifulSoup) -> list[dict]:
             continue
 
         no      = no_m.group(1)
-        # 清理：去除連續空白、頁碼雜訊
         content = re.sub(r"[ \t]+", " ", content)
         content = re.sub(r"\n{3,}", "\n\n", content).strip()
 
-        # 只保留有實質內容的條文（>15字）
-        if len(content) > 15:
+        if len(content) > 10:
             articles.append(_build(no, content))
         i += 2
 
@@ -200,57 +194,34 @@ def fetch_articles() -> list[dict]:
 
 
 # ==========================================
-# 5. 儲存 JSON
+# 5. 儲存 JSON（獨立檔案，原始格式 + embedding 用清洗格式）
 # ==========================================
 def save_json(articles: list[dict]) -> str:
-    out = os.path.join(BASE_DIR, "labor_law.json")
+    out = os.path.join(BASE_DIR, "labor_law_rules.json")
     with open(out, "w", encoding="utf-8") as f:
         json.dump(articles, f, ensure_ascii=False, indent=2)
     print(f"[JSON] 已儲存：{out}")
     return out
 
 
-# ==========================================
-# 6. 匯入 ChromaDB
-# ==========================================
-def load_to_chromadb(articles: list[dict]):
-    try:
-        import chromadb
-        from chromadb.utils import embedding_functions
-    except ImportError:
-        print("[ChromaDB] 未安裝，跳過。pip install chromadb sentence-transformers")
-        return
-
-    db_path = os.path.join(BASE_DIR, "law_db")
-    client  = chromadb.PersistentClient(path=db_path)
-    emb_fn  = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="shibing624/text2vec-base-chinese"
-    )
-
-    try:
-        client.delete_collection("labor_law_collection")
-        print("[ChromaDB] 已清除舊 collection")
-    except Exception:
-        pass
-
-    col = client.create_collection(name="labor_law_collection", embedding_function=emb_fn)
-
-    batch = 50
-    for i in range(0, len(articles), batch):
-        chunk = articles[i: i + batch]
-        col.add(
-            ids       =[f"art_{a['article_no']}" for a in chunk],
-            documents =[f"{a['title']}\n{a['content']}" for a in chunk],
-            metadatas =[{"source": a["source"], "law": a["law_name"], "no": a["article_no"]} for a in chunk],
-        )
-        print(f"[ChromaDB] 匯入 {min(i+batch, len(articles))}/{len(articles)} 條")
-        time.sleep(0.05)
-
-    print(f"[ChromaDB] 完成！共 {col.count()} 筆")
+def save_cleaned_json(articles: list[dict]) -> str:
+    cleaned = [
+        {
+            "source"    : LAW_NAME,
+            "article_no": a["title"],
+            "text"      : f"【{LAW_NAME} {a['title']}】\n{a['content']}",
+        }
+        for a in articles
+    ]
+    out = os.path.join(BASE_DIR, "labor_law_rules_cleaned.json")
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(cleaned, f, ensure_ascii=False, indent=2)
+    print(f"[JSON] 已儲存：{out}")
+    return out
 
 
 # ==========================================
-# 7. 主程式
+# 6. 主程式
 # ==========================================
 if __name__ == "__main__":
     print("=" * 50)
@@ -264,14 +235,13 @@ if __name__ == "__main__":
         exit(1)
 
     save_json(articles)
-    load_to_chromadb(articles)
+    save_cleaned_json(articles)
 
     print("\n✅ 全部完成！")
     print(f"   條文數：{len(articles)}")
-    print(f"   JSON  ：{os.path.join(BASE_DIR, 'labor_law.json')}")
-    print(f"   DB    ：{os.path.join(BASE_DIR, 'law_db')}")
+    print(f"   JSON    ：{os.path.join(BASE_DIR, 'labor_law_rules.json')}")
+    print(f"   Cleaned：{os.path.join(BASE_DIR, 'labor_law_rules_cleaned.json')}")
 
-    # 印出前 3 條預覽
     print("\n── 前 3 條預覽 ──")
     for a in articles[:3]:
         print(f"  [{a['title']}] {a['content'][:60]}...")

@@ -123,10 +123,15 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
         genai.configure(api_key=api_key)
         model, law_emb, law_texts, law_metas, case_emb, case_texts, case_metas = _load_index()
 
-        # 檢索用的 embedding 模型是中文專用，非中文提問先翻成中文再檢索，
-        # 可大幅提升法條/案例的命中率；翻譯失敗則退回用原文檢索。
+        # 檢索用的 embedding 模型是中文專用。
+        # 判斷方式：中文字（含標點）佔比 < 30% 就視為非中文，無論 UI 語言設定為何都先翻譯。
+        # 這樣即使使用者 UI 設定為「繁體中文」但直接打越南文/英文，仍能正確檢索。
+        def _is_chinese(text: str) -> bool:
+            chinese_chars = sum(1 for c in text if "一" <= c <= "鿿")
+            return chinese_chars / max(len(text), 1) >= 0.3
+
         search_query = user_prompt
-        if ui_lang != "繁體中文":
+        if not _is_chinese(user_prompt):
             try:
                 translator = genai.GenerativeModel(model_name="gemini-2.5-flash")
                 search_query = translator.generate_content(

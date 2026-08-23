@@ -87,6 +87,9 @@ OVERTIME_FORCE_ARTICLES = {"第 24 條", "第 32 條", "第 36 條"}
 TERMINATION_KEYWORDS = ["資遣", "預告", "解僱", "解雇", "終止契約", "預告期間", "預告工資"]
 TERMINATION_FORCE_ARTICLES = {"第 16 條", "第 17 條"}
 
+LEAVE_KEYWORDS = ["特別休假", "年假", "休假天數", "特休"]
+LEAVE_FORCE_ARTICLES = {"第 38 條"}
+
 
 def _force_include_articles(query, results, texts, metas, keywords, force_article_nos, source="勞動基準法"):
     # 法條索引現在同時混了勞基法本法與施行細則，兩者的 article_no 可能撞號
@@ -142,6 +145,9 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
             )
         l_results = _force_include_articles(
             search_query, l_results, law_texts, law_metas, TERMINATION_KEYWORDS, TERMINATION_FORCE_ARTICLES
+        )
+        l_results = _force_include_articles(
+            search_query, l_results, law_texts, law_metas, LEAVE_KEYWORDS, LEAVE_FORCE_ARTICLES
         )
         c_results = _search(model, search_query, case_emb, case_texts, case_metas, top_k=5)
 

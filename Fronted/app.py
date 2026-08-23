@@ -91,6 +91,9 @@ TERMINATION_FORCE_ARTICLES = {"第 11 條", "第 12 條", "第 13 條", "第 14 
 LEAVE_KEYWORDS = ["特別休假", "年假", "休假天數", "特休"]
 LEAVE_FORCE_ARTICLES = {"第 38 條"}
 
+HOLIDAY_KEYWORDS = ["國定假日", "例假", "休息日", "國假", "補休", "假日出勤", "假日上班", "輪班假日"]
+HOLIDAY_FORCE_ARTICLES = {"第 36 條", "第 37 條", "第 39 條"}
+
 
 def _force_include_articles(query, results, texts, metas, keywords, force_article_nos, source="勞動基準法"):
     # 法條索引現在同時混了勞基法本法與施行細則，兩者的 article_no 可能撞號
@@ -154,6 +157,9 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
         )
         l_results = _force_include_articles(
             search_query, l_results, law_texts, law_metas, LEAVE_KEYWORDS, LEAVE_FORCE_ARTICLES
+        )
+        l_results = _force_include_articles(
+            search_query, l_results, law_texts, law_metas, HOLIDAY_KEYWORDS, HOLIDAY_FORCE_ARTICLES
         )
         c_results = _search(model, search_query, case_emb, case_texts, case_metas, top_k=5)
 

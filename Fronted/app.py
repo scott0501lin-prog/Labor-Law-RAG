@@ -84,8 +84,9 @@ COMP_LEAVE_FORCE_ARTICLES = {"第 32-1 條"}
 OVERTIME_KEYWORDS = ["加班", "延長工作時間", "延長工時", "休息日工作", "例假工作", "假日加班"]
 OVERTIME_FORCE_ARTICLES = {"第 24 條", "第 32 條", "第 36 條"}
 
-TERMINATION_KEYWORDS = ["資遣", "預告", "解僱", "解雇", "終止契約", "預告期間", "預告工資"]
-TERMINATION_FORCE_ARTICLES = {"第 16 條", "第 17 條"}
+TERMINATION_KEYWORDS = ["資遣", "預告", "解僱", "解雇", "終止契約", "預告期間", "預告工資",
+                        "合法解僱", "解僱事由", "終止勞動契約"]
+TERMINATION_FORCE_ARTICLES = {"第 11 條", "第 12 條", "第 13 條", "第 14 條", "第 16 條", "第 17 條"}
 
 LEAVE_KEYWORDS = ["特別休假", "年假", "休假天數", "特休"]
 LEAVE_FORCE_ARTICLES = {"第 38 條"}

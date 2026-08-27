@@ -21,6 +21,7 @@ CASE_FILES = [
     "mol_qa_cases.json",
     "mol_fint_cases.json",
     "judicial_cases.json",
+    "derived_interpretations.json",
 ]
 
 

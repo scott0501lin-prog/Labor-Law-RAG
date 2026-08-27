@@ -84,6 +84,12 @@ COMP_LEAVE_FORCE_ARTICLES = {"第 32-1 條"}
 OVERTIME_KEYWORDS = ["加班", "延長工作時間", "延長工時", "休息日工作", "例假工作", "假日加班"]
 OVERTIME_FORCE_ARTICLES = {"第 24 條", "第 32 條", "第 36 條"}
 
+# 「休息日出勤超過 8 小時，第 9 小時起計給 2 又 2/3 倍」出自勞動部勞動條 2 字第
+# 1050030466 號書函，但這筆函釋在 embedding 檢索排名不穩定、常常掉出前 5 名
+# （見 backend/derived_interpretations.json），所以跟法條一樣用關鍵字強制帶入。
+# 只在「休息日」與加班關鍵字同時出現時才觸發，避免非休息日的一般加班問題也被硬塞。
+RESTDAY_OVERTIME_FORCE_TITLES = {"勞動部勞動條 2 字第 1050030466 號書函"}
+
 
 def _force_include_articles(query, results, texts, metas, keywords, force_article_nos, source="勞動基準法"):
     # 法條索引現在同時混了勞基法本法與施行細則，兩者的 article_no 可能撞號
@@ -98,6 +104,18 @@ def _force_include_articles(query, results, texts, metas, keywords, force_articl
         if m.get("article_no") in force_article_nos
         and m.get("article_no") not in existing
         and m.get("source") == source
+    ]
+    return forced + results
+
+
+def _force_include_cases(query, results, texts, metas, keywords, force_titles):
+    if not any(k in query for k in keywords) or "休息日" not in query:
+        return results
+    existing = {m.get("title") for _, m, _ in results}
+    forced = [
+        (texts[i], m, None)
+        for i, m in enumerate(metas)
+        if m.get("title") in force_titles and m.get("title") not in existing
     ]
     return forced + results
 
@@ -138,6 +156,9 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
                 search_query, l_results, law_texts, law_metas, OVERTIME_KEYWORDS, OVERTIME_FORCE_ARTICLES
             )
         c_results = _search(model, search_query, case_emb, case_texts, case_metas, top_k=5)
+        c_results = _force_include_cases(
+            search_query, c_results, case_texts, case_metas, OVERTIME_KEYWORDS, RESTDAY_OVERTIME_FORCE_TITLES
+        )
 
         law_ctx = ""
         for d, m, _ in l_results:

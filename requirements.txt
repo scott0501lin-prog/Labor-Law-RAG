@@ -1,6 +1,5 @@
 streamlit
 google-generativeai
-chromadb
 sentence-transformers
 pymongo[srv]
 python-dotenv

@@ -84,6 +84,16 @@ COMP_LEAVE_FORCE_ARTICLES = {"第 32-1 條"}
 OVERTIME_KEYWORDS = ["加班", "延長工作時間", "延長工時", "休息日工作", "例假工作", "假日加班"]
 OVERTIME_FORCE_ARTICLES = {"第 24 條", "第 32 條", "第 36 條"}
 
+TERMINATION_KEYWORDS = ["資遣", "預告", "解僱", "解雇", "終止契約", "預告期間", "預告工資",
+                        "合法解僱", "解僱事由", "終止勞動契約"]
+TERMINATION_FORCE_ARTICLES = {"第 11 條", "第 12 條", "第 13 條", "第 14 條", "第 16 條", "第 17 條"}
+
+LEAVE_KEYWORDS = ["特別休假", "年假", "休假天數", "特休"]
+LEAVE_FORCE_ARTICLES = {"第 38 條"}
+
+HOLIDAY_KEYWORDS = ["國定假日", "例假", "休息日", "國假", "補休", "假日出勤", "假日上班", "輪班假日"]
+HOLIDAY_FORCE_ARTICLES = {"第 36 條", "第 37 條", "第 39 條"}
+
 # 「休息日出勤超過 8 小時，第 9 小時起計給 2 又 2/3 倍」出自勞動部勞動條 2 字第
 # 1050030466 號書函，但這筆函釋在 embedding 檢索排名不穩定、常常掉出前 5 名
 # （見 backend/derived_interpretations.json），所以跟法條一樣用關鍵字強制帶入。
@@ -134,10 +144,15 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
         genai.configure(api_key=api_key)
         model, law_emb, law_texts, law_metas, case_emb, case_texts, case_metas = _load_index()
 
-        # 檢索用的 embedding 模型是中文專用，非中文提問先翻成中文再檢索，
-        # 可大幅提升法條/案例的命中率；翻譯失敗則退回用原文檢索。
+        # 檢索用的 embedding 模型是中文專用。
+        # 判斷方式：中文字（含標點）佔比 < 30% 就視為非中文，無論 UI 語言設定為何都先翻譯。
+        # 這樣即使使用者 UI 設定為「繁體中文」但直接打越南文/英文，仍能正確檢索。
+        def _is_chinese(text: str) -> bool:
+            chinese_chars = sum(1 for c in text if "一" <= c <= "鿿")
+            return chinese_chars / max(len(text), 1) >= 0.3
+
         search_query = user_prompt
-        if ui_lang != "繁體中文":
+        if not _is_chinese(user_prompt):
             try:
                 translator = genai.GenerativeModel(model_name="gemini-2.5-flash")
                 search_query = translator.generate_content(
@@ -155,6 +170,15 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
             l_results = _force_include_articles(
                 search_query, l_results, law_texts, law_metas, OVERTIME_KEYWORDS, OVERTIME_FORCE_ARTICLES
             )
+        l_results = _force_include_articles(
+            search_query, l_results, law_texts, law_metas, TERMINATION_KEYWORDS, TERMINATION_FORCE_ARTICLES
+        )
+        l_results = _force_include_articles(
+            search_query, l_results, law_texts, law_metas, LEAVE_KEYWORDS, LEAVE_FORCE_ARTICLES
+        )
+        l_results = _force_include_articles(
+            search_query, l_results, law_texts, law_metas, HOLIDAY_KEYWORDS, HOLIDAY_FORCE_ARTICLES
+        )
         c_results = _search(model, search_query, case_emb, case_texts, case_metas, top_k=5)
         c_results = _force_include_cases(
             search_query, c_results, case_texts, case_metas, OVERTIME_KEYWORDS, RESTDAY_OVERTIME_FORCE_TITLES
@@ -169,16 +193,31 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
             url_line = f"\n【網址】：{m['url']}" if m.get("url") else ""
             case_ctx += f"【{m.get('source', '')} — {m.get('category', '')}】\n{d}{url_line}\n\n"
 
-        lang_name = LANGUAGES.get(ui_lang, "Traditional Chinese")
-        lang_rule = (
-            ""
-            if ui_lang == "繁體中文"
-            else f"\n8. 除「📖 法條依據」區塊中的法條原文須保留繁體中文（避免翻譯造成法律歧義）外，"
-                 f"其餘所有文字（結論、📂 參考案例、💡 說明）請使用「{lang_name}」撰寫；"
-                 f"法條原文後方請附上一句{lang_name}白話翻譯。"
-                 f"加班費倍率的數字（如 4/3、5/3、1.33、1.66）翻譯時必須維持原本數值與格式，"
-                 f"不可換算成百分比或四捨五入成其他數字。"
-        )
+        # 回答語言邏輯：
+        # 1. 若輸入為非中文 → 偵測輸入語言，用輸入語言回答（優先）
+        # 2. 若輸入為中文但 UI 語言設為其他 → 用 UI 語言回答
+        # 3. 其餘 → 繁體中文
+        input_is_chinese = _is_chinese(user_prompt)
+        if not input_is_chinese:
+            lang_name = "the same language as the user's question (auto-detect)"
+            lang_rule = (
+                f"\n8. 除「📖 法條依據」區塊中的法條原文須保留繁體中文（避免翻譯造成法律歧義）外，"
+                f"其餘所有文字（結論、📂 參考案例、💡 說明）請使用與使用者提問相同的語言撰寫"
+                f"（例如使用者用越南文提問就用越南文回答，英文提問就用英文回答）；"
+                f"法條原文後方請附上一句該語言的白話翻譯。"
+                f"加班費倍率的數字（如 4/3、5/3、1.33、1.66）必須維持原本數值與格式，不可換算。"
+            )
+        elif ui_lang != "繁體中文":
+            lang_name = LANGUAGES.get(ui_lang, "Traditional Chinese")
+            lang_rule = (
+                f"\n8. 除「📖 法條依據」區塊中的法條原文須保留繁體中文（避免翻譯造成法律歧義）外，"
+                f"其餘所有文字（結論、📂 參考案例、💡 說明）請使用「{lang_name}」撰寫；"
+                f"法條原文後方請附上一句{lang_name}白話翻譯。"
+                f"加班費倍率的數字（如 4/3、5/3、1.33、1.66）必須維持原本數值與格式，不可換算。"
+            )
+        else:
+            lang_name = "Traditional Chinese"
+            lang_rule = ""
 
         final_prompt = f"""
 【相關法規條文】（資料庫檢索）：

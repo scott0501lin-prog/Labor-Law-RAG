@@ -117,18 +117,16 @@ def _force_include_articles(query, results, texts, metas, keywords, force_articl
 # ==========================================
 def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
     try:
-        import google.generativeai as genai
+        from google import genai
+        from google.genai import types
 
         api_key = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
         if not api_key:
             return t(ui_lang, "err_no_api_key")
 
-        genai.configure(api_key=api_key)
+        client = genai.Client(api_key=api_key)
         model, law_emb, law_texts, law_metas, case_emb, case_texts, case_metas = _load_index()
 
-        # 檢索用的 embedding 模型是中文專用。
-        # 判斷方式：中文字（含標點）佔比 < 30% 就視為非中文，無論 UI 語言設定為何都先翻譯。
-        # 這樣即使使用者 UI 設定為「繁體中文」但直接打越南文/英文，仍能正確檢索。
         def _is_chinese(text: str) -> bool:
             chinese_chars = sum(1 for c in text if "一" <= c <= "鿿")
             return chinese_chars / max(len(text), 1) >= 0.3
@@ -136,9 +134,9 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
         search_query = user_prompt
         if not _is_chinese(user_prompt):
             try:
-                translator = genai.GenerativeModel(model_name="gemini-2.5-flash")
-                search_query = translator.generate_content(
-                    f"請將以下使用者問題翻譯成繁體中文，只需要輸出翻譯結果，不要加任何說明：\n\n{user_prompt}"
+                search_query = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=f"請將以下使用者問題翻譯成繁體中文，只需要輸出翻譯結果，不要加任何說明：\n\n{user_prompt}"
                 ).text.strip()
             except Exception:
                 search_query = user_prompt
@@ -226,8 +224,12 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
    「剛滿」某年），須以該年資對應的較低級距（未滿下一級距）計算，並可在「💡 說明」中
    註明何時會晉升到下一級距。{lang_rule}
 """
-        model = genai.GenerativeModel(model_name="gemini-2.5-flash", system_instruction=system_prompt)
-        return model.generate_content(final_prompt).text
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=final_prompt,
+            config=types.GenerateContentConfig(system_instruction=system_prompt),
+        )
+        return response.text
 
     except Exception as e:
         return f"🚨 異常：{str(e)}"

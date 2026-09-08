@@ -1,0 +1,5 @@
+judicial_cases.json | source: {'司法院'} | sample categories: ['裁判書-給付退休金', '裁判書-給付資遣費', '裁判書-給付工資', '裁判書-確認僱傭關係']
+mol_fint_cases.json | source: {'勞動部'} | sample categories: ['函釋']
+mol_qa_cases.json | source: {'勞動部'} | sample categories: ['常見問答-勞動契約', '常見問答-資遣費']
+ntpc_cases.json | source: {'新北市勞工局'} | sample categories: ['最新消息']
+taipei_cases.json | source: {'台北市勞動局'} | sample categories: ['常見問答']

@@ -72,18 +72,23 @@ def inject_css():
         color: #dde3f0 !important;
     }
     [data-testid="stSidebar"] .stButton > button {
-        background: rgba(255,255,255,0.07) !important;
+        background: #1e3060 !important;
         color: #dde3f0 !important;
-        border: 1px solid rgba(255,255,255,0.12) !important;
+        border: 1px solid rgba(255,255,255,0.15) !important;
         border-radius: 8px !important;
         font-size: 0.875rem;
         text-align: left;
         transition: all 0.18s ease;
     }
     [data-testid="stSidebar"] .stButton > button:hover {
-        background: rgba(201,168,76,0.18) !important;
-        border-color: rgba(201,168,76,0.45) !important;
+        background: rgba(201,168,76,0.22) !important;
+        border-color: rgba(201,168,76,0.5) !important;
         color: #f5e090 !important;
+    }
+    [data-testid="stSidebar"] .stButton > button:focus,
+    [data-testid="stSidebar"] .stButton > button:active {
+        background: #1e3060 !important;
+        color: #dde3f0 !important;
     }
     [data-testid="stSidebar"] hr {
         border-color: rgba(255,255,255,0.1) !important;

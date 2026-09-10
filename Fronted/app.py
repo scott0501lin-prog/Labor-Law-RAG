@@ -71,7 +71,10 @@ def inject_css():
     [data-testid="stSidebar"] h3 {
         color: #dde3f0 !important;
     }
-    [data-testid="stSidebar"] .stButton > button {
+    section[data-testid="stSidebar"] button,
+    section[data-testid="stSidebar"] .stButton > button,
+    section[data-testid="stSidebar"] div[data-testid="stButton"] > button {
+        background-color: #1e3060 !important;
         background: #1e3060 !important;
         color: #dde3f0 !important;
         border: 1px solid rgba(255,255,255,0.15) !important;
@@ -80,15 +83,21 @@ def inject_css():
         text-align: left;
         transition: all 0.18s ease;
     }
-    [data-testid="stSidebar"] .stButton > button:hover {
-        background: rgba(201,168,76,0.22) !important;
-        border-color: rgba(201,168,76,0.5) !important;
+    section[data-testid="stSidebar"] button:hover,
+    section[data-testid="stSidebar"] .stButton > button:hover {
+        background-color: rgba(201,168,76,0.25) !important;
+        background: rgba(201,168,76,0.25) !important;
+        border-color: rgba(201,168,76,0.55) !important;
         color: #f5e090 !important;
     }
-    [data-testid="stSidebar"] .stButton > button:focus,
-    [data-testid="stSidebar"] .stButton > button:active {
+    section[data-testid="stSidebar"] button:focus,
+    section[data-testid="stSidebar"] button:active,
+    section[data-testid="stSidebar"] .stButton > button:focus,
+    section[data-testid="stSidebar"] .stButton > button:active {
+        background-color: #1e3060 !important;
         background: #1e3060 !important;
         color: #dde3f0 !important;
+        box-shadow: none !important;
     }
     [data-testid="stSidebar"] hr {
         border-color: rgba(255,255,255,0.1) !important;

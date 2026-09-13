@@ -377,15 +377,14 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
             url_line = f"\n【網址】：{m['url']}" if m.get("url") else ""
             case_ctx += f"【{m.get('source', '')} — {m.get('category', '')}】\n{d}{url_line}\n\n"
 
-        # 回答語言邏輯：永遠跟著輸入語言走，UI 語言設定只影響介面文字。
-        # 輸入中文 → 繁體中文回答；輸入其他語言 → 用該語言回答。
-        input_is_chinese = _is_chinese(user_prompt)
-        if not input_is_chinese:
+        # 回答語言邏輯：永遠跟著 UI 語言選項走。
+        # 使用者在語言下拉選 English → AI 用英文回答，以此類推。
+        if ui_lang != "繁體中文":
+            lang_name = LANGUAGES.get(ui_lang, "Traditional Chinese")
             lang_rule = (
                 f"\n8. 除「📖 法條依據」區塊中的法條原文須保留繁體中文（避免翻譯造成法律歧義）外，"
-                f"其餘所有文字（結論、📂 參考案例、💡 說明）請使用與使用者提問相同的語言撰寫"
-                f"（例如使用者用越南文提問就用越南文回答，英文提問就用英文回答）；"
-                f"法條原文後方請附上一句該語言的白話翻譯。"
+                f"其餘所有文字（結論、📂 參考案例、💡 說明）請使用「{lang_name}」撰寫；"
+                f"法條原文後方請附上一句{lang_name}白話翻譯。"
                 f"加班費倍率的數字（如 4/3、5/3、1.33、1.66）必須維持原本數值與格式，不可換算。"
             )
         else:

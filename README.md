@@ -102,5 +102,5 @@ streamlit run Fronted/app.py
 
 ## 開發團隊
 
-國立 XX 大學 資訊管理學系  
+淡江大學 資訊管理學系  
 畢業專題 — 2026 年

@@ -8,6 +8,13 @@ from dotenv import load_dotenv
 from db import init_indexes, register_user, verify_user, save_chat, list_chats, load_chat
 from i18n import LANGUAGES, DB_MSG_KEYS, t
 
+st.set_page_config(
+    page_title="勞資爭議智慧法務 AI 顧問",
+    page_icon="⚖️",
+    layout="wide",
+    initial_sidebar_state="auto",
+)
+
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(base_dir, ".env"))
 
@@ -33,6 +40,185 @@ defaults = {
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+
+def inject_css():
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700&family=Inter:wght@400;500;600&display=swap');
+
+    html, body, .stApp {
+        font-family: 'Noto Sans TC', 'Inter', -apple-system, sans-serif !important;
+    }
+
+    /* 隱藏 Streamlit 預設元素 */
+    #MainMenu, footer { visibility: hidden; }
+    .stDeployButton { display: none !important; }
+
+    /* 主背景 */
+    .stApp { background: #f0f4f8; }
+
+    /* ── 側邊欄 ── */
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #1a2744 0%, #243257 100%) !important;
+    }
+    [data-testid="stSidebar"] p,
+    [data-testid="stSidebar"] span,
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] div,
+    [data-testid="stSidebar"] h1,
+    [data-testid="stSidebar"] h2,
+    [data-testid="stSidebar"] h3 {
+        color: #dde3f0 !important;
+    }
+    section[data-testid="stSidebar"] button,
+    section[data-testid="stSidebar"] .stButton > button,
+    section[data-testid="stSidebar"] div[data-testid="stButton"] > button {
+        background-color: #1e3060 !important;
+        background: #1e3060 !important;
+        color: #dde3f0 !important;
+        border: 1px solid rgba(255,255,255,0.15) !important;
+        border-radius: 8px !important;
+        font-size: 0.875rem;
+        text-align: left;
+        transition: all 0.18s ease;
+    }
+    section[data-testid="stSidebar"] button:hover,
+    section[data-testid="stSidebar"] .stButton > button:hover {
+        background-color: rgba(201,168,76,0.25) !important;
+        background: rgba(201,168,76,0.25) !important;
+        border-color: rgba(201,168,76,0.55) !important;
+        color: #f5e090 !important;
+    }
+    section[data-testid="stSidebar"] button:focus,
+    section[data-testid="stSidebar"] button:active,
+    section[data-testid="stSidebar"] .stButton > button:focus,
+    section[data-testid="stSidebar"] .stButton > button:active {
+        background-color: #1e3060 !important;
+        background: #1e3060 !important;
+        color: #dde3f0 !important;
+        box-shadow: none !important;
+    }
+    [data-testid="stSidebar"] hr {
+        border-color: rgba(255,255,255,0.1) !important;
+    }
+
+    /* selectbox in sidebar */
+    [data-testid="stSidebar"] [data-baseweb="select"] > div {
+        background: rgba(255,255,255,0.1) !important;
+        border-color: rgba(255,255,255,0.2) !important;
+        border-radius: 8px !important;
+        color: #dde3f0 !important;
+    }
+    [data-testid="stSidebar"] [data-baseweb="select"] svg { fill: #dde3f0 !important; }
+
+    /* ── 標題 ── */
+    h1 { color: #1a2744 !important; font-weight: 700 !important; letter-spacing: -0.3px; }
+    h2, h3 { color: #243257 !important; font-weight: 600 !important; }
+
+    /* ── Tabs ── */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 4px;
+        border-bottom: 2px solid #d1dae8;
+        background: transparent;
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 8px 8px 0 0;
+        padding: 0.55rem 1.4rem;
+        font-weight: 500;
+        color: #64748b;
+        background: transparent;
+    }
+    .stTabs [aria-selected="true"] {
+        color: #1a2744 !important;
+        background: white !important;
+        border-top: 3px solid #c9a84c !important;
+        font-weight: 600;
+    }
+
+    /* ── 輸入框 ── */
+    .stTextInput > div > div > input {
+        border-radius: 8px !important;
+        border: 1.5px solid #c8d4e3 !important;
+        padding: 0.55rem 1rem !important;
+        font-size: 0.95rem;
+        background: white !important;
+        transition: border-color 0.18s;
+    }
+    .stTextInput > div > div > input:focus {
+        border-color: #1a2744 !important;
+        box-shadow: 0 0 0 3px rgba(26,39,68,0.08) !important;
+    }
+
+    /* ── 一般按鈕（主內容區） ── */
+    .main .stButton > button {
+        border-radius: 8px !important;
+        font-weight: 500 !important;
+        border: 1.5px solid #c0ccdd !important;
+        color: #1a2744 !important;
+        background: white !important;
+        transition: all 0.18s ease !important;
+    }
+    .main .stButton > button:hover {
+        background: #1a2744 !important;
+        color: white !important;
+        border-color: #1a2744 !important;
+        box-shadow: 0 4px 14px rgba(26,39,68,0.18) !important;
+        transform: translateY(-1px);
+    }
+
+    /* ── 表單送出按鈕 ── */
+    [data-testid="stFormSubmitButton"] > button {
+        background: linear-gradient(135deg, #1a2744, #2a4080) !important;
+        color: white !important;
+        border: none !important;
+        border-radius: 8px !important;
+        font-weight: 600 !important;
+        font-size: 1rem !important;
+        padding: 0.65rem !important;
+        letter-spacing: 0.2px;
+        transition: all 0.18s ease !important;
+    }
+    [data-testid="stFormSubmitButton"] > button:hover {
+        background: linear-gradient(135deg, #243257, #1a2744) !important;
+        box-shadow: 0 6px 20px rgba(26,39,68,0.35) !important;
+        transform: translateY(-1px);
+    }
+
+    /* ── Alert 卡片 ── */
+    .stAlert { border-radius: 12px !important; }
+
+    /* ── 聊天訊息 ── */
+    [data-testid="stChatMessage"] { border-radius: 12px !important; }
+
+    /* ── 分隔線 ── */
+    hr { border-color: #dde3f0 !important; margin: 0.8rem 0 !important; }
+
+    /* ── 登入頁置中 ── */
+    .login-wrapper {
+        max-width: 440px;
+        margin: 0 auto;
+        padding: 2.5rem 2rem;
+        background: white;
+        border-radius: 16px;
+        box-shadow: 0 4px 24px rgba(26,39,68,0.10);
+    }
+
+    /* ── Landing 身份卡片 ── */
+    .role-card {
+        background: white;
+        border-radius: 14px;
+        padding: 1.8rem;
+        box-shadow: 0 2px 12px rgba(26,39,68,0.08);
+        border: 2px solid transparent;
+        transition: border-color 0.18s, box-shadow 0.18s;
+        height: 100%;
+    }
+    .role-card:hover { border-color: #c9a84c; box-shadow: 0 6px 24px rgba(26,39,68,0.14); }
+    .role-card h3 { margin-top: 0; font-size: 1.15rem; }
+    .role-card p { color: #4a5568; font-size: 0.92rem; line-height: 1.6; margin-bottom: 1.2rem; }
+    </style>
+    """, unsafe_allow_html=True)
 
 
 def render_language_switcher():
@@ -135,18 +321,16 @@ def _force_include_cases(query, results, texts, metas, keywords, force_titles):
 # ==========================================
 def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
     try:
-        import google.generativeai as genai
+        from google import genai
+        from google.genai import types
 
         api_key = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
         if not api_key:
             return t(ui_lang, "err_no_api_key")
 
-        genai.configure(api_key=api_key)
+        client = genai.Client(api_key=api_key)
         model, law_emb, law_texts, law_metas, case_emb, case_texts, case_metas = _load_index()
 
-        # 檢索用的 embedding 模型是中文專用。
-        # 判斷方式：中文字（含標點）佔比 < 30% 就視為非中文，無論 UI 語言設定為何都先翻譯。
-        # 這樣即使使用者 UI 設定為「繁體中文」但直接打越南文/英文，仍能正確檢索。
         def _is_chinese(text: str) -> bool:
             chinese_chars = sum(1 for c in text if "一" <= c <= "鿿")
             return chinese_chars / max(len(text), 1) >= 0.3
@@ -154,9 +338,9 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
         search_query = user_prompt
         if not _is_chinese(user_prompt):
             try:
-                translator = genai.GenerativeModel(model_name="gemini-2.5-flash")
-                search_query = translator.generate_content(
-                    f"請將以下使用者問題翻譯成繁體中文，只需要輸出翻譯結果，不要加任何說明：\n\n{user_prompt}"
+                search_query = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=f"請將以下使用者問題翻譯成繁體中文，只需要輸出翻譯結果，不要加任何說明：\n\n{user_prompt}"
                 ).text.strip()
             except Exception:
                 search_query = user_prompt
@@ -193,21 +377,9 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
             url_line = f"\n【網址】：{m['url']}" if m.get("url") else ""
             case_ctx += f"【{m.get('source', '')} — {m.get('category', '')}】\n{d}{url_line}\n\n"
 
-        # 回答語言邏輯：
-        # 1. 若輸入為非中文 → 偵測輸入語言，用輸入語言回答（優先）
-        # 2. 若輸入為中文但 UI 語言設為其他 → 用 UI 語言回答
-        # 3. 其餘 → 繁體中文
-        input_is_chinese = _is_chinese(user_prompt)
-        if not input_is_chinese:
-            lang_name = "the same language as the user's question (auto-detect)"
-            lang_rule = (
-                f"\n8. 除「📖 法條依據」區塊中的法條原文須保留繁體中文（避免翻譯造成法律歧義）外，"
-                f"其餘所有文字（結論、📂 參考案例、💡 說明）請使用與使用者提問相同的語言撰寫"
-                f"（例如使用者用越南文提問就用越南文回答，英文提問就用英文回答）；"
-                f"法條原文後方請附上一句該語言的白話翻譯。"
-                f"加班費倍率的數字（如 4/3、5/3、1.33、1.66）必須維持原本數值與格式，不可換算。"
-            )
-        elif ui_lang != "繁體中文":
+        # 回答語言邏輯：永遠跟著 UI 語言選項走。
+        # 使用者在語言下拉選 English → AI 用英文回答，以此類推。
+        if ui_lang != "繁體中文":
             lang_name = LANGUAGES.get(ui_lang, "Traditional Chinese")
             lang_rule = (
                 f"\n8. 除「📖 法條依據」區塊中的法條原文須保留繁體中文（避免翻譯造成法律歧義）外，"
@@ -216,7 +388,6 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
                 f"加班費倍率的數字（如 4/3、5/3、1.33、1.66）必須維持原本數值與格式，不可換算。"
             )
         else:
-            lang_name = "Traditional Chinese"
             lang_rule = ""
 
         final_prompt = f"""
@@ -247,8 +418,12 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
    「剛滿」某年），須以該年資對應的較低級距（未滿下一級距）計算，並可在「💡 說明」中
    註明何時會晉升到下一級距。{lang_rule}
 """
-        model = genai.GenerativeModel(model_name="gemini-2.5-flash", system_instruction=system_prompt)
-        return model.generate_content(final_prompt).text
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=final_prompt,
+            config=types.GenerateContentConfig(system_instruction=system_prompt),
+        )
+        return response.text
 
     except Exception as e:
         return f"🚨 異常：{str(e)}"
@@ -261,48 +436,56 @@ def show_login_page():
     render_language_switcher()
     lang = st.session_state.ui_lang
 
-    st.markdown("<br><br>", unsafe_allow_html=True)
-    st.title(t(lang, "app_title"))
-    st.subheader(t(lang, "login_subheader"))
+    st.markdown("<br>", unsafe_allow_html=True)
+    _, mid, _ = st.columns([1, 2, 1])
+    with mid:
+        st.markdown(
+            "<div style='text-align:center; margin-bottom:0.5rem;'>"
+            "<span style='font-size:3rem;'>⚖️</span>"
+            "</div>"
+            f"<h2 style='text-align:center; color:#1a2744; font-size:1.45rem; margin-bottom:0.2rem;'>{t(lang, 'app_title').replace('⚖️ ','')}</h2>"
+            f"<p style='text-align:center; color:#64748b; margin-bottom:1.5rem; font-size:0.95rem;'>{t(lang, 'login_subheader')}</p>",
+            unsafe_allow_html=True,
+        )
 
-    tab_login, tab_register = st.tabs([t(lang, "tab_login"), t(lang, "tab_register")])
+        tab_login, tab_register = st.tabs([t(lang, "tab_login"), t(lang, "tab_register")])
 
-    with tab_login:
-        with st.form("login_form"):
-            username = st.text_input(t(lang, "field_username"))
-            password = st.text_input(t(lang, "field_password"), type="password")
-            if st.form_submit_button(t(lang, "btn_login"), use_container_width=True):
-                if not username or not password:
-                    st.error(t(lang, "err_empty_credentials"))
-                else:
-                    ok, result = verify_user(username.strip(), password)
-                    if ok:
-                        st.session_state.logged_in = True
-                        st.session_state.username  = result
-                        st.session_state.page      = "Landing"
-                        st.rerun()
+        with tab_login:
+            with st.form("login_form"):
+                username = st.text_input(t(lang, "field_username"))
+                password = st.text_input(t(lang, "field_password"), type="password")
+                if st.form_submit_button(t(lang, "btn_login"), use_container_width=True):
+                    if not username or not password:
+                        st.error(t(lang, "err_empty_credentials"))
                     else:
-                        st.error(t(lang, DB_MSG_KEYS.get(result, result)))
+                        ok, result = verify_user(username.strip(), password)
+                        if ok:
+                            st.session_state.logged_in = True
+                            st.session_state.username  = result
+                            st.session_state.page      = "Landing"
+                            st.rerun()
+                        else:
+                            st.error(t(lang, DB_MSG_KEYS.get(result, result)))
 
-    with tab_register:
-        with st.form("register_form"):
-            new_user  = st.text_input(t(lang, "field_username"), key="reg_user")
-            new_pass  = st.text_input(t(lang, "field_password_hint"), type="password")
-            new_pass2 = st.text_input(t(lang, "field_password_confirm"), type="password")
-            if st.form_submit_button(t(lang, "btn_register"), use_container_width=True):
-                if not new_user or not new_pass:
-                    st.error(t(lang, "err_empty_credentials"))
-                elif len(new_pass) < 6:
-                    st.error(t(lang, "err_password_too_short"))
-                elif new_pass != new_pass2:
-                    st.error(t(lang, "err_password_mismatch"))
-                else:
-                    ok, msg = register_user(new_user.strip(), new_pass)
-                    localized_msg = t(lang, DB_MSG_KEYS.get(msg, msg))
-                    if ok:
-                        st.success(localized_msg + t(lang, "msg_register_success_suffix"))
+        with tab_register:
+            with st.form("register_form"):
+                new_user  = st.text_input(t(lang, "field_username"), key="reg_user")
+                new_pass  = st.text_input(t(lang, "field_password_hint"), type="password")
+                new_pass2 = st.text_input(t(lang, "field_password_confirm"), type="password")
+                if st.form_submit_button(t(lang, "btn_register"), use_container_width=True):
+                    if not new_user or not new_pass:
+                        st.error(t(lang, "err_empty_credentials"))
+                    elif len(new_pass) < 6:
+                        st.error(t(lang, "err_password_too_short"))
+                    elif new_pass != new_pass2:
+                        st.error(t(lang, "err_password_mismatch"))
                     else:
-                        st.error(localized_msg)
+                        ok, msg = register_user(new_user.strip(), new_pass)
+                        localized_msg = t(lang, DB_MSG_KEYS.get(msg, msg))
+                        if ok:
+                            st.success(localized_msg + t(lang, "msg_register_success_suffix"))
+                        else:
+                            st.error(localized_msg)
 
 
 # ==========================================
@@ -312,35 +495,49 @@ def show_landing_page():
     render_language_switcher()
     lang = st.session_state.ui_lang
 
-    st.markdown("<br><br>", unsafe_allow_html=True)
-    st.title(t(lang, "app_title"))
-    st.subheader(t(lang, "landing_subheader"))
-    st.write(t(lang, "landing_desc"))
-    st.divider()
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown(
+        "<h1 style='text-align:center; color:#1a2744;'>⚖️ " + t(lang, "app_title").replace("⚖️ ", "") + "</h1>"
+        f"<p style='text-align:center; color:#4a5568; font-size:1.05rem; margin-bottom:0.3rem;'>{t(lang, 'landing_subheader')}</p>"
+        f"<p style='text-align:center; color:#64748b; font-size:0.9rem; margin-bottom:2rem;'>{t(lang, 'landing_desc')}</p>",
+        unsafe_allow_html=True,
+    )
 
-    col1, col2 = st.columns(2)
+    _, c1, _, c2, _ = st.columns([0.5, 3, 0.3, 3, 0.5])
 
-    with col1:
-        st.info(t(lang, "role_employee_title"))
-        st.write(t(lang, "role_employee_desc"))
-        if st.button(t(lang, "role_employee_btn"), use_container_width=True):
+    with c1:
+        st.markdown(
+            "<div class='role-card'>"
+            "<h3>🙋‍♂️ " + t(lang, "role_label_employee") + "</h3>"
+            f"<p>{t(lang, 'role_employee_desc')}</p>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("<div style='margin-top:0.6rem;'></div>", unsafe_allow_html=True)
+        if st.button(t(lang, "role_employee_btn"), use_container_width=True, key="emp_btn"):
             st.session_state.user_role        = "Employee"
             st.session_state.page             = "Chat"
             st.session_state.messages         = []
             st.session_state.current_chat_id  = None
             st.rerun()
 
-    with col2:
-        st.warning(t(lang, "role_employer_title"))
-        st.write(t(lang, "role_employer_desc"))
-        if st.button(t(lang, "role_employer_btn"), use_container_width=True):
+    with c2:
+        st.markdown(
+            "<div class='role-card'>"
+            "<h3>🏢 " + t(lang, "role_label_employer") + "</h3>"
+            f"<p>{t(lang, 'role_employer_desc')}</p>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("<div style='margin-top:0.6rem;'></div>", unsafe_allow_html=True)
+        if st.button(t(lang, "role_employer_btn"), use_container_width=True, key="er_btn"):
             st.session_state.user_role        = "Employer"
             st.session_state.page             = "Chat"
             st.session_state.messages         = []
             st.session_state.current_chat_id  = None
             st.rerun()
 
-    st.markdown("<br><br><br>", unsafe_allow_html=True)
+    st.markdown("<br><br>", unsafe_allow_html=True)
     st.caption(t(lang, "landing_caption").format(username=st.session_state.username))
 
 
@@ -464,6 +661,8 @@ def show_chat_room():
 # ==========================================
 # 7. 主程式 — 頁面路由
 # ==========================================
+inject_css()
+
 if not st.session_state.logged_in:
     show_login_page()
 elif st.session_state.page == "Landing":

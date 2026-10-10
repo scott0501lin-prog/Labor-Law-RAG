@@ -1,6 +1,8 @@
 import streamlit as st
 import os
 import uuid
+import time
+import logging
 from datetime import timezone
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -249,12 +251,21 @@ def _load_index():
     return model, law_emb, law_texts, law_metas, case_emb, case_texts, case_metas
 
 
-def _search(model, query, embeddings, texts, metas, top_k=3):
+def _search(model, query, embeddings, texts, metas, top_k=5, _top_k_chunks=20):
     import numpy as np
     q_emb = model.encode([query], normalize_embeddings=True)
     scores = (embeddings @ q_emb.T).flatten()
-    top_idx = np.argsort(scores)[::-1][:top_k]
-    return [(texts[i], metas[i], float(scores[i])) for i in top_idx]
+    top_idx = np.argsort(scores)[::-1][:_top_k_chunks]
+
+    # 以 parent_id 合併：同一份文件只保留分數最高的那塊
+    seen = {}
+    for i in top_idx:
+        pid = metas[i].get("parent_id", str(i))
+        if pid not in seen or scores[i] > seen[pid][1]:
+            seen[pid] = (i, float(scores[i]))
+
+    merged = sorted(seen.values(), key=lambda x: x[1], reverse=True)[:top_k]
+    return [(texts[i], metas[i], score) for i, score in merged]
 
 
 # 加班費是最常被問、也最容易被 embedding 檢索漏掉的主題（問句越長、細節越多，
@@ -319,6 +330,15 @@ def _force_include_cases(query, results, texts, metas, keywords, force_titles):
 # ==========================================
 # 4. 後端 RAG 引擎 (Gemini + Numpy 搜尋)
 # ==========================================
+_rag_logger = logging.getLogger("rag_timing")
+if not _rag_logger.handlers:
+    _rag_log_path = os.path.join(base_dir, "rag_timing.log")
+    _rag_handler = logging.FileHandler(_rag_log_path, encoding="utf-8")
+    _rag_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    _rag_logger.addHandler(_rag_handler)
+    _rag_logger.setLevel(logging.INFO)
+
+
 def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
     try:
         from google import genai
@@ -329,7 +349,10 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
             return t(ui_lang, "err_no_api_key")
 
         client = genai.Client(api_key=api_key)
+        _t0 = time.perf_counter()
+
         model, law_emb, law_texts, law_metas, case_emb, case_texts, case_metas = _load_index()
+        _t_load = time.perf_counter()
 
         def _is_chinese(text: str) -> bool:
             chinese_chars = sum(1 for c in text if "一" <= c <= "鿿")
@@ -344,8 +367,11 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
                 ).text.strip()
             except Exception:
                 search_query = user_prompt
+        _t_trans = time.perf_counter()
 
         l_results = _search(model, search_query, law_emb,  law_texts,  law_metas,  top_k=5)
+        _t_law_search = time.perf_counter()
+
         if any(k in search_query for k in COMP_LEAVE_KEYWORDS):
             l_results = _force_include_articles(
                 search_query, l_results, law_texts, law_metas, COMP_LEAVE_KEYWORDS, COMP_LEAVE_FORCE_ARTICLES
@@ -363,19 +389,26 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
         l_results = _force_include_articles(
             search_query, l_results, law_texts, law_metas, HOLIDAY_KEYWORDS, HOLIDAY_FORCE_ARTICLES
         )
+        _t_force_l = time.perf_counter()
+
         c_results = _search(model, search_query, case_emb, case_texts, case_metas, top_k=5)
+        _t_case_search = time.perf_counter()
+
         c_results = _force_include_cases(
             search_query, c_results, case_texts, case_metas, OVERTIME_KEYWORDS, RESTDAY_OVERTIME_FORCE_TITLES
         )
+        _t_force_c = time.perf_counter()
 
         law_ctx = ""
         for d, m, _ in l_results:
-            law_ctx += f"【法規內容】：{d}\n【條號】：{m.get('source', '')} {m.get('article_no', '')}\n\n"
+            display = m.get("display_text", d)   # 完整條文；舊索引 fallback 用 embed chunk
+            law_ctx += f"【法規內容】：{display}\n【條號】：{m.get('source', '')} {m.get('article_no', '')}\n\n"
 
         case_ctx = ""
         for d, m, _ in c_results:
+            display  = m.get("display_text", d)  # 主文+鄰近chunk；舊索引 fallback 用 embed chunk
             url_line = f"\n【網址】：{m['url']}" if m.get("url") else ""
-            case_ctx += f"【{m.get('source', '')} — {m.get('category', '')}】\n{d}{url_line}\n\n"
+            case_ctx += f"【{m.get('source', '')} — {m.get('category', '')}】\n{display}{url_line}\n\n"
 
         # 回答語言邏輯：永遠跟著 UI 語言選項走。
         # 使用者在語言下拉選 English → AI 用英文回答，以此類推。
@@ -418,11 +451,28 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
    「剛滿」某年），須以該年資對應的較低級距（未滿下一級距）計算，並可在「💡 說明」中
    註明何時會晉升到下一級距。{lang_rule}
 """
+        _t_prompt = time.perf_counter()
+
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=final_prompt,
             config=types.GenerateContentConfig(system_instruction=system_prompt),
         )
+        _t_gemini = time.perf_counter()
+
+        _rag_logger.info(
+            f"q={user_prompt[:25]!r} zh={_is_chinese(user_prompt)} "
+            f"load={_t_load-_t0:.3f}s "
+            f"trans={_t_trans-_t_load:.3f}s "
+            f"law_search={_t_law_search-_t_trans:.3f}s "
+            f"force_l={_t_force_l-_t_law_search:.3f}s "
+            f"case_search={_t_case_search-_t_force_l:.3f}s "
+            f"force_c={_t_force_c-_t_case_search:.3f}s "
+            f"prompt={_t_prompt-_t_force_c:.3f}s "
+            f"gemini={_t_gemini-_t_prompt:.3f}s "
+            f"total={_t_gemini-_t0:.3f}s"
+        )
+
         return response.text
 
     except Exception as e:

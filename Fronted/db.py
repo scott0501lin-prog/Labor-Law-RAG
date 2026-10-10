@@ -50,18 +50,49 @@ def _hash_password(password: str, salt: str = None) -> tuple[str, str]:
     return pw_hash, salt
 
 
-def register_user(username: str, password: str) -> tuple[bool, str]:
+def register_user(username: str, password: str,
+                   security_question: str = "", security_answer: str = "") -> tuple[bool, str]:
     pw_hash, salt = _hash_password(password)
+    doc = {
+        "username": username,
+        "password_hash": f"{salt}:{pw_hash}",
+        "created_at": datetime.now(timezone.utc),
+    }
+    if security_question and security_answer:
+        ans_hash, ans_salt = _hash_password(security_answer.strip().lower())
+        doc["security_question"] = security_question
+        doc["security_answer_hash"] = f"{ans_salt}:{ans_hash}"
     db = get_db()
     try:
-        db.users.insert_one({
-            "username": username,
-            "password_hash": f"{salt}:{pw_hash}",
-            "created_at": datetime.now(timezone.utc),
-        })
+        db.users.insert_one(doc)
         return True, "註冊成功！"
     except DuplicateKeyError:
         return False, "帳號已存在"
+
+
+def get_security_question(username: str) -> str | None:
+    db = get_db()
+    user = db.users.find_one({"username": username}, {"security_question": 1})
+    if user is None:
+        return None
+    return user.get("security_question")
+
+
+def reset_password(username: str, security_answer: str, new_password: str) -> tuple[bool, str]:
+    db = get_db()
+    user = db.users.find_one({"username": username})
+    if user is None:
+        return False, "帳號不存在"
+    stored = user.get("security_answer_hash", "")
+    if not stored:
+        return False, "此帳號未設定密保問題"
+    ans_salt, stored_hash = stored.split(":", 1)
+    ans_hash, _ = _hash_password(security_answer.strip().lower(), ans_salt)
+    if ans_hash != stored_hash:
+        return False, "密保答案錯誤"
+    pw_hash, pw_salt = _hash_password(new_password)
+    db.users.update_one({"username": username}, {"$set": {"password_hash": f"{pw_salt}:{pw_hash}"}})
+    return True, "密碼重設成功！"
 
 
 def verify_user(username: str, password: str) -> tuple[bool, str]:

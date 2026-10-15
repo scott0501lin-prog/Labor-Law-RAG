@@ -6,6 +6,9 @@
 backend/law_db/
 chat_histories/
 
+# 向量索引備份（本地備份，不上傳）
+backend/embeddings_v1_backup/
+
 # Python 快取
 __pycache__/
 *.pyc

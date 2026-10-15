@@ -268,63 +268,16 @@ def _search(model, query, embeddings, texts, metas, top_k=5, _top_k_chunks=20):
     return [(texts[i], metas[i], score) for i, score in merged]
 
 
-# 加班費是最常被問、也最容易被 embedding 檢索漏掉的主題（問句越長、細節越多，
-# 排名越不穩定）。偵測到這些關鍵字時，強制把核心條文塞進結果，不依賴 embedding 排名。
-#
-# 「換補休」類提問實際對應的法條是第 32-1 條（補休轉換規則），跟第 24/32/36 條
-# （加班費倍率、工時上限、休息日）關聯度較低；若混在同一組關鍵字裡，會對換補休
-# 問題硬塞不對題的加班費條文。因此拆成兩組、依優先序互斥處理：換補休類優先比對，
-# 命中就只保底第 32-1 條；否則才落回一般加班費/工時類的保底。
-COMP_LEAVE_KEYWORDS = ["補休", "換休", "以休代薪", "代替休假"]
-COMP_LEAVE_FORCE_ARTICLES = {"第 32-1 條"}
-
-OVERTIME_KEYWORDS = ["加班", "延長工作時間", "延長工時", "休息日工作", "例假工作", "假日加班"]
-OVERTIME_FORCE_ARTICLES = {"第 24 條", "第 32 條", "第 36 條"}
-
-TERMINATION_KEYWORDS = ["資遣", "預告", "解僱", "解雇", "終止契約", "預告期間", "預告工資",
-                        "合法解僱", "解僱事由", "終止勞動契約"]
-TERMINATION_FORCE_ARTICLES = {"第 11 條", "第 12 條", "第 13 條", "第 14 條", "第 16 條", "第 17 條"}
-
-LEAVE_KEYWORDS = ["特別休假", "年假", "休假天數", "特休"]
-LEAVE_FORCE_ARTICLES = {"第 38 條"}
-
-HOLIDAY_KEYWORDS = ["國定假日", "例假", "休息日", "國假", "補休", "假日出勤", "假日上班", "輪班假日"]
-HOLIDAY_FORCE_ARTICLES = {"第 36 條", "第 37 條", "第 39 條"}
-
-# 「休息日出勤超過 8 小時，第 9 小時起計給 2 又 2/3 倍」出自勞動部勞動條 2 字第
-# 1050030466 號書函，但這筆函釋在 embedding 檢索排名不穩定、常常掉出前 5 名
-# （見 backend/derived_interpretations.json），所以跟法條一樣用關鍵字強制帶入。
-# 只在「休息日」與加班關鍵字同時出現時才觸發，避免非休息日的一般加班問題也被硬塞。
-RESTDAY_OVERTIME_FORCE_TITLES = {"勞動部勞動條 2 字第 1050030466 號書函"}
-
-
-def _force_include_articles(query, results, texts, metas, keywords, force_article_nos, source="勞動基準法"):
-    # 法條索引現在同時混了勞基法本法與施行細則，兩者的 article_no 可能撞號
-    # （例如兩邊都各自有自己的「第 24 條」），所以強制帶入時一定要限定
-    # source，否則可能誤把施行細則裡不相關的同號條文塞進來。
-    if not any(k in query for k in keywords):
-        return results
-    existing = {m.get("article_no") for _, m, _ in results}
-    forced = [
-        (texts[i], m, None)
-        for i, m in enumerate(metas)
-        if m.get("article_no") in force_article_nos
-        and m.get("article_no") not in existing
-        and m.get("source") == source
-    ]
-    return forced + results
-
-
-def _force_include_cases(query, results, texts, metas, keywords, force_titles):
-    if not any(k in query for k in keywords) or "休息日" not in query:
-        return results
-    existing = {m.get("title") for _, m, _ in results}
-    forced = [
-        (texts[i], m, None)
-        for i, m in enumerate(metas)
-        if m.get("title") in force_titles and m.get("title") not in existing
-    ]
-    return forced + results
+# Force-include rules, constants, and helper functions live in force_rules.py
+# so eval/test_force_rules.py can import the real implementation without
+# pulling in Streamlit / Gemini / numpy.
+from force_rules import (
+    FORCE_ARTICLE_RULES,
+    MAX_FORCED_LAW_RESULTS,
+    RESTDAY_OVERTIME_FORCE_TITLES,
+    _force_include_articles,
+    _force_include_cases,
+)
 
 
 # ==========================================
@@ -372,30 +325,26 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
         l_results = _search(model, search_query, law_emb,  law_texts,  law_metas,  top_k=5)
         _t_law_search = time.perf_counter()
 
-        if any(k in search_query for k in COMP_LEAVE_KEYWORDS):
-            l_results = _force_include_articles(
-                search_query, l_results, law_texts, law_metas, COMP_LEAVE_KEYWORDS, COMP_LEAVE_FORCE_ARTICLES
-            )
-        else:
-            l_results = _force_include_articles(
-                search_query, l_results, law_texts, law_metas, OVERTIME_KEYWORDS, OVERTIME_FORCE_ARTICLES
-            )
-        l_results = _force_include_articles(
-            search_query, l_results, law_texts, law_metas, TERMINATION_KEYWORDS, TERMINATION_FORCE_ARTICLES
-        )
-        l_results = _force_include_articles(
-            search_query, l_results, law_texts, law_metas, LEAVE_KEYWORDS, LEAVE_FORCE_ARTICLES
-        )
-        l_results = _force_include_articles(
-            search_query, l_results, law_texts, law_metas, HOLIDAY_KEYWORDS, HOLIDAY_FORCE_ARTICLES
-        )
+        fired_mutex: set = set()
+        for rule in FORCE_ARTICLE_RULES:
+            if rule["mutex"] and rule["mutex"] in fired_mutex:
+                continue
+            if any(k in search_query for k in rule["keywords"]):
+                l_results = _force_include_articles(
+                    search_query, l_results, law_texts, law_metas,
+                    rule["keywords"], rule["articles"]
+                )
+                if rule["mutex"]:
+                    fired_mutex.add(rule["mutex"])
+        l_results = l_results[:MAX_FORCED_LAW_RESULTS]
         _t_force_l = time.perf_counter()
 
         c_results = _search(model, search_query, case_emb, case_texts, case_metas, top_k=5)
         _t_case_search = time.perf_counter()
 
+        _overtime_kw = next(r["keywords"] for r in FORCE_ARTICLE_RULES if r["name"] == "加班延長工時")
         c_results = _force_include_cases(
-            search_query, c_results, case_texts, case_metas, OVERTIME_KEYWORDS, RESTDAY_OVERTIME_FORCE_TITLES
+            search_query, c_results, case_texts, case_metas, _overtime_kw, RESTDAY_OVERTIME_FORCE_TITLES
         )
         _t_force_c = time.perf_counter()
 

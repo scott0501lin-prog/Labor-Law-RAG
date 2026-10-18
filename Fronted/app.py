@@ -9,6 +9,15 @@ from dotenv import load_dotenv
 
 from db import init_indexes, register_user, verify_user, save_chat, list_chats, load_chat
 from i18n import LANGUAGES, DB_MSG_KEYS, t
+from intent_config import (
+    ENABLE_INTENT_DETECTION,
+    MAX_FOLLOWUP_ROUNDS,
+    SKIP_FOLLOWUP_TRIGGERS,
+    SKIP_MAX_LEN,
+    MISSING_FIELDS_LABELS,
+    INTENT_ANALYSIS_PROMPT,
+    OVERTIME_EXTRACTION_PROMPT,
+)
 
 st.set_page_config(
     page_title="勞資爭議智慧法務 AI 顧問",
@@ -38,6 +47,9 @@ defaults = {
     "current_chat_id": None,
     "btn_input": None,
     "ui_lang": "繁體中文",
+    # intent-detection state (reset when a complete RAG answer is given)
+    "intent_ctx": None,    # dict with original_query/translated_query/scenario/known_info
+    "followup_count": 0,   # number of follow-up rounds completed in current dialog
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -281,6 +293,170 @@ from force_rules import (
 
 
 # ==========================================
+# 3b. 意圖判斷 + 情境追問輔助函式
+# ==========================================
+import json as _json
+import re as _re
+
+
+def _gemini_json_call(prompt_text: str) -> dict | None:
+    """Fire a Gemini call and return parsed JSON dict, or None on any failure."""
+    try:
+        from google import genai as _genai
+        api_key = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            return None
+        client = _genai.Client(api_key=api_key)
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt_text,
+        )
+        text = resp.text.strip()
+        # Strip optional ```json ... ``` wrapper Gemini sometimes adds
+        m = _re.search(r'\{.*\}', text, _re.DOTALL)
+        if m:
+            text = m.group()
+        return _json.loads(text)
+    except Exception:
+        return None
+
+
+def _analyze_intent(user_message: str, known_info: dict, ui_lang: str) -> dict | None:
+    """First-pass: classify intent, detect scenario, extract known fields.
+
+    Returns a dict with keys: translated_query, intent, scenario, known_info,
+    missing_fields, follow_up. Returns None on JSON parse failure (caller falls
+    back to the original RAG flow).
+    """
+    prompt = INTENT_ANALYSIS_PROMPT.format(
+        user_message=user_message,
+        known_info_json=_json.dumps(known_info, ensure_ascii=False),
+        ui_lang=ui_lang,
+    )
+    return _gemini_json_call(prompt)
+
+
+def _extract_overtime_fields(user_message: str, known_info: dict, ui_lang: str) -> dict | None:
+    """Mid-dialog extraction: parse field values from a follow-up answer.
+
+    Does NOT re-classify intent. Returns a dict with is_new_question, known_info,
+    missing_fields, follow_up. Returns None on failure (caller falls back).
+    """
+    prompt = OVERTIME_EXTRACTION_PROMPT.format(
+        user_message=user_message,
+        known_info_json=_json.dumps(known_info, ensure_ascii=False),
+        ui_lang=ui_lang,
+    )
+    return _gemini_json_call(prompt)
+
+
+def _build_enriched_query(translated_query: str, known_info: dict) -> str:
+    """Append collected field values to translated_query for a richer RAG search."""
+    parts = [translated_query]
+    if known_info.get("day_type"):
+        parts.append(known_info["day_type"])
+    if known_info.get("hours") is not None:
+        parts.append(f"加班 {known_info['hours']} 小時")
+    if known_info.get("wage_type") and known_info.get("wage_amount"):
+        parts.append(f"{known_info['wage_type']} {known_info['wage_amount']} 元")
+    elif known_info.get("wage_type"):
+        parts.append(known_info["wage_type"])
+    elif known_info.get("wage_amount"):
+        parts.append(f"薪資 {known_info['wage_amount']} 元")
+    if known_info.get("compensation_type"):
+        parts.append(known_info["compensation_type"])
+    return "，".join(parts)
+
+
+def _handle_prompt(prompt: str, persona: str, lang: str) -> str:
+    """Route a user prompt through intent detection + optional follow-up + RAG.
+
+    Falls back to query_rag_system() directly whenever intent detection is
+    disabled, JSON parsing fails, or the scenario is not overtime_pay.
+    """
+    def _is_skip(text: str) -> bool:
+        return (
+            len(text) <= SKIP_MAX_LEN
+            and any(kw in text for kw in SKIP_FOLLOWUP_TRIGGERS)
+        )
+
+    def _new_question(qprompt: str) -> str:
+        """Handle a fresh (non-mid-dialog) question."""
+        analysis = _analyze_intent(qprompt, {}, lang)
+        if (
+            analysis
+            and analysis.get("intent") == "solve_problem"
+            and analysis.get("scenario") == "overtime_pay"
+            and analysis.get("missing_fields")
+            and not _is_skip(qprompt)
+        ):
+            st.session_state.intent_ctx = {
+                "original_query":   qprompt,
+                "translated_query": analysis.get("translated_query") or qprompt,
+                "scenario":         "overtime_pay",
+                "known_info":       analysis.get("known_info") or {},
+            }
+            st.session_state.followup_count = 0
+            return analysis.get("follow_up") or ""
+        else:
+            sq = analysis.get("translated_query") if analysis else None
+            return query_rag_system(qprompt, persona, lang, search_query_override=sq)
+
+    if not ENABLE_INTENT_DETECTION:
+        return query_rag_system(prompt, persona, lang)
+
+    ctx = st.session_state.intent_ctx
+
+    if ctx is not None:
+        # ── Mid-dialog: processing a follow-up answer ─────────────────────
+        if _is_skip(prompt):
+            st.session_state.intent_ctx = None
+            st.session_state.followup_count = 0
+            return query_rag_system(
+                ctx["original_query"], persona, lang,
+                search_query_override=ctx["translated_query"],
+            )
+
+        result = _extract_overtime_fields(prompt, ctx["known_info"], lang)
+        if result is None:
+            # JSON failure → fallback with what we have
+            st.session_state.intent_ctx = None
+            st.session_state.followup_count = 0
+            return query_rag_system(
+                ctx["original_query"], persona, lang,
+                search_query_override=ctx["translated_query"],
+            )
+
+        if result.get("is_new_question"):
+            st.session_state.intent_ctx = None
+            st.session_state.followup_count = 0
+            return _new_question(prompt)
+
+        # Merge new non-null values into known_info
+        for k, v in (result.get("known_info") or {}).items():
+            if v is not None:
+                ctx["known_info"][k] = v
+        st.session_state.followup_count += 1
+        missing = result.get("missing_fields") or []
+
+        if missing and st.session_state.followup_count < MAX_FOLLOWUP_ROUNDS:
+            return result.get("follow_up") or ""
+
+        # Reached limit or all fields collected → proceed to RAG
+        enriched = _build_enriched_query(ctx["translated_query"], ctx["known_info"])
+        st.session_state.intent_ctx = None
+        st.session_state.followup_count = 0
+        return query_rag_system(
+            enriched, persona, lang,
+            search_query_override=enriched,
+            missing_fields=missing or None,
+        )
+
+    else:
+        return _new_question(prompt)
+
+
+# ==========================================
 # 4. 後端 RAG 引擎 (Gemini + Numpy 搜尋)
 # ==========================================
 _rag_logger = logging.getLogger("rag_timing")
@@ -292,7 +468,22 @@ if not _rag_logger.handlers:
     _rag_logger.setLevel(logging.INFO)
 
 
-def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
+def query_rag_system(
+    user_prompt: str,
+    system_prompt: str,
+    ui_lang: str,
+    *,
+    search_query_override: str | None = None,
+    missing_fields: list[str] | None = None,
+) -> str:
+    """Run the full RAG pipeline and return a response string.
+
+    search_query_override: pre-translated Chinese query from _analyze_intent;
+        if provided, the internal translation call is skipped.
+    missing_fields: list of required field names that were not collected;
+        if non-empty, a disclaimer is appended to final_prompt asking Gemini
+        NOT to assume values.
+    """
     try:
         from google import genai
         from google.genai import types
@@ -311,15 +502,19 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
             chinese_chars = sum(1 for c in text if "一" <= c <= "鿿")
             return chinese_chars / max(len(text), 1) >= 0.3
 
-        search_query = user_prompt
-        if not _is_chinese(user_prompt):
-            try:
-                search_query = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=f"請將以下使用者問題翻譯成繁體中文，只需要輸出翻譯結果，不要加任何說明：\n\n{user_prompt}"
-                ).text.strip()
-            except Exception:
-                search_query = user_prompt
+        if search_query_override is not None:
+            # Translation already done by _analyze_intent — skip the extra call
+            search_query = search_query_override
+        else:
+            search_query = user_prompt
+            if not _is_chinese(user_prompt):
+                try:
+                    search_query = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=f"請將以下使用者問題翻譯成繁體中文，只需要輸出翻譯結果，不要加任何說明：\n\n{user_prompt}"
+                    ).text.strip()
+                except Exception:
+                    search_query = user_prompt
         _t_trans = time.perf_counter()
 
         l_results = _search(model, search_query, law_emb,  law_texts,  law_metas,  top_k=5)
@@ -372,6 +567,20 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
         else:
             lang_rule = ""
 
+        # Missing-fields disclaimer — only appended when fields were still absent
+        # after the follow-up dialog, so Gemini won't invent numbers.
+        if missing_fields:
+            labels = "、".join(
+                MISSING_FIELDS_LABELS.get(f, f) for f in missing_fields
+            )
+            missing_note = (
+                f"\n\n【重要提示：本問題因缺少以下資訊，僅能提供一般情況說明，"
+                f"請勿自行假設任何數值，如需精確計算請補充後重新詢問。】\n"
+                f"缺少的資訊：{labels}"
+            )
+        else:
+            missing_note = ""
+
         final_prompt = f"""
 【相關法規條文】（資料庫檢索）：
 {law_ctx}
@@ -398,7 +607,7 @@ def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
    全文只能使用該款對應的數字；「結論」與「📖 法條依據」引用的級距與數字必須完全一致，
    不可一邊寫某一級距的天數、另一邊卻引用其他級距的法條。若年資剛好落在級距交界（例如
    「剛滿」某年），須以該年資對應的較低級距（未滿下一級距）計算，並可在「💡 說明」中
-   註明何時會晉升到下一級距。{lang_rule}
+   註明何時會晉升到下一級距。{lang_rule}{missing_note}
 """
         _t_prompt = time.perf_counter()
 
@@ -645,7 +854,7 @@ def show_chat_room():
 
         with st.chat_message("assistant"):
             with st.spinner(t(lang, "thinking_spinner")):
-                resp = query_rag_system(prompt, persona, lang)
+                resp = _handle_prompt(prompt, persona, lang)
                 st.markdown(resp)
         st.session_state.messages.append({"role": "assistant", "content": resp})
 

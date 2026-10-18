@@ -299,12 +299,13 @@ import json as _json
 import re as _re
 
 
-def _gemini_json_call(prompt_text: str) -> dict | None:
+def _gemini_json_call(prompt_text: str, _label: str = "intent") -> dict | None:
     """Fire a Gemini call and return parsed JSON dict, or None on any failure."""
     try:
         from google import genai as _genai
         api_key = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
         if not api_key:
+            print(f"[INTENT] [{_label}] API key 未設定，略過")
             return None
         client = _genai.Client(api_key=api_key)
         resp = client.models.generate_content(
@@ -312,12 +313,16 @@ def _gemini_json_call(prompt_text: str) -> dict | None:
             contents=prompt_text,
         )
         text = resp.text.strip()
+        print(f"[INTENT] [{_label}] Gemini 原始回傳: {text!r}")
         # Strip optional ```json ... ``` wrapper Gemini sometimes adds
         m = _re.search(r'\{.*\}', text, _re.DOTALL)
         if m:
             text = m.group()
-        return _json.loads(text)
-    except Exception:
+        result = _json.loads(text)
+        print(f"[INTENT] [{_label}] 解析成功")
+        return result
+    except Exception as _e:
+        print(f"[INTENT] [{_label}] 解析失敗: {_e}")
         return None
 
 
@@ -328,12 +333,22 @@ def _analyze_intent(user_message: str, known_info: dict, ui_lang: str) -> dict |
     missing_fields, follow_up. Returns None on JSON parse failure (caller falls
     back to the original RAG flow).
     """
+    print(f"[INTENT] _analyze_intent 呼叫 | 問句: {user_message!r}")
     prompt = INTENT_ANALYSIS_PROMPT.format(
         user_message=user_message,
         known_info_json=_json.dumps(known_info, ensure_ascii=False),
         ui_lang=ui_lang,
     )
-    return _gemini_json_call(prompt)
+    result = _gemini_json_call(prompt, _label="analyze_intent")
+    if result:
+        print(f"[INTENT]   intent       = {result.get('intent')!r}")
+        print(f"[INTENT]   scenario     = {result.get('scenario')!r}")
+        print(f"[INTENT]   known_info   = {result.get('known_info')}")
+        print(f"[INTENT]   missing_fields = {result.get('missing_fields')}")
+        print(f"[INTENT]   follow_up    = {result.get('follow_up')!r}")
+    else:
+        print("[INTENT] _analyze_intent: 結果為 None（解析失敗）")
+    return result
 
 
 def _extract_overtime_fields(user_message: str, known_info: dict, ui_lang: str) -> dict | None:
@@ -342,12 +357,21 @@ def _extract_overtime_fields(user_message: str, known_info: dict, ui_lang: str) 
     Does NOT re-classify intent. Returns a dict with is_new_question, known_info,
     missing_fields, follow_up. Returns None on failure (caller falls back).
     """
+    print(f"[INTENT] _extract_overtime_fields 呼叫 | 回覆: {user_message!r}")
     prompt = OVERTIME_EXTRACTION_PROMPT.format(
         user_message=user_message,
         known_info_json=_json.dumps(known_info, ensure_ascii=False),
         ui_lang=ui_lang,
     )
-    return _gemini_json_call(prompt)
+    result = _gemini_json_call(prompt, _label="extract_fields")
+    if result:
+        print(f"[INTENT]   is_new_question = {result.get('is_new_question')}")
+        print(f"[INTENT]   known_info      = {result.get('known_info')}")
+        print(f"[INTENT]   missing_fields  = {result.get('missing_fields')}")
+        print(f"[INTENT]   follow_up       = {result.get('follow_up')!r}")
+    else:
+        print("[INTENT] _extract_overtime_fields: 結果為 None（解析失敗）")
+    return result
 
 
 def _build_enriched_query(translated_query: str, known_info: dict) -> str:
@@ -374,6 +398,10 @@ def _handle_prompt(prompt: str, persona: str, lang: str) -> str:
     Falls back to query_rag_system() directly whenever intent detection is
     disabled, JSON parsing fails, or the scenario is not overtime_pay.
     """
+    print(f"[INTENT] ── _handle_prompt ──────────────────────────────")
+    print(f"[INTENT] ENABLE_INTENT_DETECTION = {ENABLE_INTENT_DETECTION}")
+    print(f"[INTENT] 使用者問句: {prompt!r}")
+
     def _is_skip(text: str) -> bool:
         return (
             len(text) <= SKIP_MAX_LEN
@@ -390,6 +418,7 @@ def _handle_prompt(prompt: str, persona: str, lang: str) -> str:
             and analysis.get("missing_fields")
             and not _is_skip(qprompt)
         ):
+            print(f"[INTENT] 分支: 追問 | follow_up={analysis.get('follow_up')!r}")
             st.session_state.intent_ctx = {
                 "original_query":   qprompt,
                 "translated_query": analysis.get("translated_query") or qprompt,
@@ -399,17 +428,22 @@ def _handle_prompt(prompt: str, persona: str, lang: str) -> str:
             st.session_state.followup_count = 0
             return analysis.get("follow_up") or ""
         else:
+            reason = "解析失敗" if not analysis else f"intent={analysis.get('intent')!r} scenario={analysis.get('scenario')!r}"
+            print(f"[INTENT] 分支: 直接 RAG | {reason}")
             sq = analysis.get("translated_query") if analysis else None
             return query_rag_system(qprompt, persona, lang, search_query_override=sq)
 
     if not ENABLE_INTENT_DETECTION:
+        print("[INTENT] 未執行: 功能關閉 (ENABLE_INTENT_DETECTION=False) → 直接 RAG")
         return query_rag_system(prompt, persona, lang)
 
     ctx = st.session_state.intent_ctx
+    print(f"[INTENT] intent_ctx = {'有進行中對話' if ctx else '無 (新問題)'}")
 
     if ctx is not None:
         # ── Mid-dialog: processing a follow-up answer ─────────────────────
         if _is_skip(prompt):
+            print(f"[INTENT] 分支: mid-dialog 跳過 → 直接 RAG (原問句)")
             st.session_state.intent_ctx = None
             st.session_state.followup_count = 0
             return query_rag_system(
@@ -420,6 +454,7 @@ def _handle_prompt(prompt: str, persona: str, lang: str) -> str:
         result = _extract_overtime_fields(prompt, ctx["known_info"], lang)
         if result is None:
             # JSON failure → fallback with what we have
+            print("[INTENT] 分支: extraction 解析失敗 → fallback RAG (原問句)")
             st.session_state.intent_ctx = None
             st.session_state.followup_count = 0
             return query_rag_system(
@@ -428,6 +463,7 @@ def _handle_prompt(prompt: str, persona: str, lang: str) -> str:
             )
 
         if result.get("is_new_question"):
+            print("[INTENT] 分支: is_new_question=True → 清空 ctx，重新分析新問題")
             st.session_state.intent_ctx = None
             st.session_state.followup_count = 0
             return _new_question(prompt)
@@ -440,10 +476,12 @@ def _handle_prompt(prompt: str, persona: str, lang: str) -> str:
         missing = result.get("missing_fields") or []
 
         if missing and st.session_state.followup_count < MAX_FOLLOWUP_ROUNDS:
+            print(f"[INTENT] 分支: 繼續追問 (round={st.session_state.followup_count}) | missing={missing}")
             return result.get("follow_up") or ""
 
         # Reached limit or all fields collected → proceed to RAG
         enriched = _build_enriched_query(ctx["translated_query"], ctx["known_info"])
+        print(f"[INTENT] 分支: 追問完成 → RAG | enriched={enriched!r} | missing={missing or None}")
         st.session_state.intent_ctx = None
         st.session_state.followup_count = 0
         return query_rag_system(

@@ -347,7 +347,12 @@ def _build_chroma_collections(client, emb_dir, law_texts, law_metas, case_texts,
 
 @st.cache_resource(show_spinner="正在準備索引…")
 def _load_chroma_index():
-    import chromadb, json
+    """Load or build ChromaDB collections.
+
+    Returns the 7-tuple on success, or None when both load and rebuild fail —
+    callers must fall back to the NumPy path in that case.
+    """
+    import chromadb, json, shutil
     from sentence_transformers import SentenceTransformer
 
     emb_dir = os.path.join(base_dir, "backend", "embeddings")
@@ -360,23 +365,45 @@ def _load_chroma_index():
     law_texts,  law_metas  = _load_json("law")
     case_texts, case_metas = _load_json("cases")
 
-    client   = chromadb.PersistentClient(path=_CHROMA_DB_PATH)
-    existing = {c.name for c in client.list_collections()}
+    def _try_load(rebuild: bool):
+        if rebuild:
+            print(f"[CHROMA] 索引損壞，刪除重建：{_CHROMA_DB_PATH}", flush=True)
+            shutil.rmtree(_CHROMA_DB_PATH, ignore_errors=True)
+            os.makedirs(_CHROMA_DB_PATH, exist_ok=True)
 
-    need_build = "law_chunks" not in existing or "cases_chunks" not in existing
-    if not need_build:
-        # Auto-rebuild when JSON was updated but chroma_db was not deleted
-        law_tmp   = client.get_collection("law_chunks")
-        cases_tmp = client.get_collection("cases_chunks")
-        if law_tmp.count() != len(law_texts) or cases_tmp.count() != len(case_texts):
-            need_build = True
+        client   = chromadb.PersistentClient(path=_CHROMA_DB_PATH)
+        existing = {c.name for c in client.list_collections()}
 
-    if need_build:
-        _build_chroma_collections(client, emb_dir, law_texts, law_metas, case_texts, case_metas)
+        need_build = "law_chunks" not in existing or "cases_chunks" not in existing
+        if not need_build:
+            law_tmp   = client.get_collection("law_chunks")
+            cases_tmp = client.get_collection("cases_chunks")
+            if law_tmp.count() != len(law_texts) or cases_tmp.count() != len(case_texts):
+                need_build = True
 
-    law_col   = client.get_collection("law_chunks")
-    cases_col = client.get_collection("cases_chunks")
-    model     = SentenceTransformer("shibing624/text2vec-base-chinese")
+        if need_build:
+            _build_chroma_collections(client, emb_dir, law_texts, law_metas, case_texts, case_metas)
+
+        law_col   = client.get_collection("law_chunks")
+        cases_col = client.get_collection("cases_chunks")
+        return law_col, cases_col
+
+    # First attempt (no rebuild)
+    try:
+        law_col, cases_col = _try_load(rebuild=False)
+        print(f"[CHROMA] 索引就緒：law={law_col.count()}, cases={cases_col.count()}", flush=True)
+    except Exception as e:
+        print(f"[CHROMA] 載入失敗：{e}", flush=True)
+        print("[CHROMA] 嘗試刪除重建…", flush=True)
+        # Second attempt: wipe and rebuild from .npy / .json
+        try:
+            law_col, cases_col = _try_load(rebuild=True)
+            print(f"[CHROMA] 重建成功：law={law_col.count()}, cases={cases_col.count()}", flush=True)
+        except Exception as e2:
+            print(f"[CHROMA] 重建仍失敗，退回 NumPy 路徑：{e2}", flush=True)
+            return None  # caller detects None and uses numpy
+
+    model = SentenceTransformer("shibing624/text2vec-base-chinese")
     return model, law_col, cases_col, law_texts, law_metas, case_texts, case_metas
 
 
@@ -677,9 +704,14 @@ def query_rag_system(
         client = genai.Client(api_key=api_key)
         _t0 = time.perf_counter()
 
-        if VECTOR_BACKEND == "chroma":
-            model, law_col, cases_col, law_texts, law_metas, case_texts, case_metas = _load_chroma_index()
-        else:
+        _use_chroma = VECTOR_BACKEND == "chroma"
+        if _use_chroma:
+            _chroma_res = _load_chroma_index()
+            if _chroma_res is None:
+                _use_chroma = False  # fallback: chroma failed both times
+            else:
+                model, law_col, cases_col, law_texts, law_metas, case_texts, case_metas = _chroma_res
+        if not _use_chroma:
             model, law_emb, law_texts, law_metas, case_emb, case_texts, case_metas = _load_index()
         _t_load = time.perf_counter()
 
@@ -702,7 +734,7 @@ def query_rag_system(
                     search_query = user_prompt
         _t_trans = time.perf_counter()
 
-        if VECTOR_BACKEND == "chroma":
+        if _use_chroma:
             l_results = _chroma_search(model, law_col, search_query, top_k=5)
         else:
             l_results = _search(model, search_query, law_emb, law_texts, law_metas, top_k=5)
@@ -722,7 +754,7 @@ def query_rag_system(
         l_results = l_results[:MAX_FORCED_LAW_RESULTS]
         _t_force_l = time.perf_counter()
 
-        if VECTOR_BACKEND == "chroma":
+        if _use_chroma:
             c_results = _chroma_search(model, cases_col, search_query, top_k=5)
         else:
             c_results = _search(model, search_query, case_emb, case_texts, case_metas, top_k=5)
@@ -1073,7 +1105,9 @@ def show_chat_room():
 # Pre-load index at startup so the spinner shows immediately instead of on first query.
 # @st.cache_resource ensures this runs only once per process lifetime.
 if VECTOR_BACKEND == "chroma":
-    _load_chroma_index()
+    if _load_chroma_index() is None:
+        st.warning("⚠️ Chroma 索引載入失敗（已嘗試重建），已自動退回 NumPy 路徑。詳情請查看終端機日誌。")
+        _load_index()
 else:
     _load_index()
 

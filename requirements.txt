@@ -8,3 +8,5 @@ requests
 beautifulsoup4
 numpy
 certifi
+pysqlite3-binary; sys_platform == "linux"
+psutil

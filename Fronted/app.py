@@ -4,6 +4,17 @@ import uuid
 import time
 import logging
 from datetime import timezone
+
+# sqlite3 swap for Linux (Chroma requires SQLite >= 3.35; Ubuntu 20.04 ships 3.31)
+# Must run before any 'import chromadb' anywhere in this process.
+import sys as _sys_init, platform as _platform_init
+if _platform_init.system() == "Linux":
+    try:
+        import pysqlite3 as _pysqlite3
+        _sys_init.modules["sqlite3"] = _pysqlite3
+    except ImportError:
+        pass
+del _sys_init, _platform_init
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
@@ -30,6 +41,31 @@ base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(base_dir, ".env"))
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "chroma").lower()
+
+
+def _resolve_chroma_path() -> str:
+    """Return writable path for ChromaDB; falls back to tempdir if preferred path fails."""
+    import tempfile
+    preferred = os.getenv(
+        "CHROMA_DB_PATH",
+        os.path.join(base_dir, "backend", "chroma_db"),
+    )
+    try:
+        os.makedirs(preferred, exist_ok=True)
+        probe = os.path.join(preferred, ".write_probe")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        return preferred
+    except (OSError, PermissionError):
+        tmp = os.path.join(tempfile.gettempdir(), "chroma_db")
+        os.makedirs(tmp, exist_ok=True)
+        return tmp
+
+
+_CHROMA_DB_PATH = _resolve_chroma_path()
 
 
 # ==========================================
@@ -263,6 +299,87 @@ def _load_index():
     return model, law_emb, law_texts, law_metas, case_emb, case_texts, case_metas
 
 
+# ── ChromaDB helpers ───────────────────────────────────────────────────────
+
+def _sanitize_meta(embed_text: str, meta: dict) -> dict:
+    """Return a Chroma-compatible metadata dict (no None values)."""
+    return {
+        "embed_text": embed_text,
+        "article_no": meta.get("article_no") or "",
+        "source":     meta.get("source") or "",
+        "parent_id":  meta.get("parent_id") or "",
+        "chunk_idx":  int(meta.get("chunk_idx") or 0),
+        "category":   meta.get("category") or "",
+        "title":      meta.get("title") or "",
+        "url":        meta.get("url") or "",
+    }
+
+
+def _build_chroma_collections(client, emb_dir, law_texts, law_metas, case_texts, case_metas):
+    """Populate law_chunks + cases_chunks from existing .npy / .json. No re-encoding."""
+    import numpy as np
+
+    def _populate(prefix, texts, metas):
+        emb = np.load(os.path.join(emb_dir, f"{prefix}_embeddings.npy"))
+        try:
+            client.delete_collection(f"{prefix}_chunks")
+        except Exception:
+            pass
+        col = client.create_collection(
+            f"{prefix}_chunks",
+            metadata={"hnsw:space": "cosine"},
+        )
+        ids       = [f"{prefix}_{i}" for i in range(len(texts))]
+        documents = [m.get("display_text", t) for t, m in zip(texts, metas)]
+        metadatas = [_sanitize_meta(t, m) for t, m in zip(texts, metas)]
+        BATCH = 1000
+        for s in range(0, len(ids), BATCH):
+            col.add(
+                ids=ids[s:s + BATCH],
+                embeddings=emb[s:s + BATCH].tolist(),
+                documents=documents[s:s + BATCH],
+                metadatas=metadatas[s:s + BATCH],
+            )
+
+    _populate("law",   law_texts,  law_metas)
+    _populate("cases", case_texts, case_metas)
+
+
+@st.cache_resource(show_spinner="正在準備索引…")
+def _load_chroma_index():
+    import chromadb, json
+    from sentence_transformers import SentenceTransformer
+
+    emb_dir = os.path.join(base_dir, "backend", "embeddings")
+
+    def _load_json(prefix):
+        with open(os.path.join(emb_dir, f"{prefix}_docs.json"), encoding="utf-8") as f:
+            d = json.load(f)
+        return d["texts"], d["metas"]
+
+    law_texts,  law_metas  = _load_json("law")
+    case_texts, case_metas = _load_json("cases")
+
+    client   = chromadb.PersistentClient(path=_CHROMA_DB_PATH)
+    existing = {c.name for c in client.list_collections()}
+
+    need_build = "law_chunks" not in existing or "cases_chunks" not in existing
+    if not need_build:
+        # Auto-rebuild when JSON was updated but chroma_db was not deleted
+        law_tmp   = client.get_collection("law_chunks")
+        cases_tmp = client.get_collection("cases_chunks")
+        if law_tmp.count() != len(law_texts) or cases_tmp.count() != len(case_texts):
+            need_build = True
+
+    if need_build:
+        _build_chroma_collections(client, emb_dir, law_texts, law_metas, case_texts, case_metas)
+
+    law_col   = client.get_collection("law_chunks")
+    cases_col = client.get_collection("cases_chunks")
+    model     = SentenceTransformer("shibing624/text2vec-base-chinese")
+    return model, law_col, cases_col, law_texts, law_metas, case_texts, case_metas
+
+
 def _search(model, query, embeddings, texts, metas, top_k=5, _top_k_chunks=20):
     import numpy as np
     q_emb = model.encode([query], normalize_embeddings=True)
@@ -278,6 +395,33 @@ def _search(model, query, embeddings, texts, metas, top_k=5, _top_k_chunks=20):
 
     merged = sorted(seen.values(), key=lambda x: x[1], reverse=True)[:top_k]
     return [(texts[i], metas[i], score) for i, score in merged]
+
+
+def _chroma_search(model, collection, query, top_k=5, _top_k_chunks=20):
+    """ChromaDB equivalent of _search(); returns [(text, meta, score)] in the same format."""
+    q_emb = model.encode([query], normalize_embeddings=True)  # (1, 768), L2-normalized
+    results = collection.query(
+        query_embeddings=[q_emb[0].tolist()],
+        n_results=_top_k_chunks,
+        include=["documents", "metadatas", "distances"],
+    )
+    docs      = results["documents"][0]
+    metas_raw = results["metadatas"][0]
+    distances = results["distances"][0]
+
+    # cosine distance ∈ [0, 2]; score = 1 - dist (0→identical, 1→orthogonal)
+    seen = {}  # parent_id → (text, meta, score)
+    for doc, raw_meta, dist in zip(docs, metas_raw, distances):
+        score = 1.0 - dist
+        pid   = raw_meta.get("parent_id", "")
+        if pid not in seen or score > seen[pid][2]:
+            meta = dict(raw_meta)
+            meta["display_text"] = doc       # restore display_text stored in documents
+            text = meta.pop("embed_text", doc)
+            seen[pid] = (text, meta, score)
+
+    ranked = sorted(seen.values(), key=lambda x: x[2], reverse=True)
+    return ranked[:top_k]
 
 
 # Force-include rules, constants, and helper functions live in force_rules.py
@@ -533,7 +677,10 @@ def query_rag_system(
         client = genai.Client(api_key=api_key)
         _t0 = time.perf_counter()
 
-        model, law_emb, law_texts, law_metas, case_emb, case_texts, case_metas = _load_index()
+        if VECTOR_BACKEND == "chroma":
+            model, law_col, cases_col, law_texts, law_metas, case_texts, case_metas = _load_chroma_index()
+        else:
+            model, law_emb, law_texts, law_metas, case_emb, case_texts, case_metas = _load_index()
         _t_load = time.perf_counter()
 
         def _is_chinese(text: str) -> bool:
@@ -555,7 +702,10 @@ def query_rag_system(
                     search_query = user_prompt
         _t_trans = time.perf_counter()
 
-        l_results = _search(model, search_query, law_emb,  law_texts,  law_metas,  top_k=5)
+        if VECTOR_BACKEND == "chroma":
+            l_results = _chroma_search(model, law_col, search_query, top_k=5)
+        else:
+            l_results = _search(model, search_query, law_emb, law_texts, law_metas, top_k=5)
         _t_law_search = time.perf_counter()
 
         fired_mutex: set = set()
@@ -572,7 +722,10 @@ def query_rag_system(
         l_results = l_results[:MAX_FORCED_LAW_RESULTS]
         _t_force_l = time.perf_counter()
 
-        c_results = _search(model, search_query, case_emb, case_texts, case_metas, top_k=5)
+        if VECTOR_BACKEND == "chroma":
+            c_results = _chroma_search(model, cases_col, search_query, top_k=5)
+        else:
+            c_results = _search(model, search_query, case_emb, case_texts, case_metas, top_k=5)
         _t_case_search = time.perf_counter()
 
         _overtime_kw = next(r["keywords"] for r in FORCE_ARTICLE_RULES if r["name"] == "加班延長工時")
@@ -857,6 +1010,15 @@ def show_chat_room():
                 st.session_state.btn_input = value
 
         st.divider()
+        # Memory monitor — remove after testing
+        try:
+            import psutil as _psutil
+            st.sidebar.caption(
+                f"RSS: {_psutil.Process().memory_info().rss / 1024**2:.0f} MB"
+            )
+        except ImportError:
+            pass
+
         st.markdown(f"### {t(lang, 'history_title')}")
         saved_chats = list_chats(st.session_state.username)
         if not saved_chats:
@@ -907,6 +1069,14 @@ def show_chat_room():
 # ==========================================
 # 7. 主程式 — 頁面路由
 # ==========================================
+
+# Pre-load index at startup so the spinner shows immediately instead of on first query.
+# @st.cache_resource ensures this runs only once per process lifetime.
+if VECTOR_BACKEND == "chroma":
+    _load_chroma_index()
+else:
+    _load_index()
+
 inject_css()
 
 if not st.session_state.logged_in:

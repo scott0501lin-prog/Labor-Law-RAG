@@ -44,6 +44,16 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "chroma").lower()
 
+EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3").lower()
+if "text2vec" in EMBED_MODEL:
+    _MODEL_NAME    = "shibing624/text2vec-base-chinese"
+    _MODEL_SUFFIX  = ""
+else:
+    _MODEL_NAME    = "BAAI/bge-m3"
+    _MODEL_SUFFIX  = "_bgem3"
+_LAW_COL_NAME   = f"law_chunks{_MODEL_SUFFIX}"
+_CASES_COL_NAME = f"cases_chunks{_MODEL_SUFFIX}"
+
 
 def _resolve_chroma_path() -> str:
     """Return writable path for ChromaDB; falls back to tempdir if preferred path fails."""
@@ -282,20 +292,44 @@ def render_language_switcher():
 @st.cache_resource(show_spinner="正在載入索引...")
 def _load_index():
     import json
+    import time
     import numpy as np
     from sentence_transformers import SentenceTransformer
 
     emb_dir = os.path.join(base_dir, "backend", "embeddings")
-    model   = SentenceTransformer("shibing624/text2vec-base-chinese")
+
+    t0 = time.perf_counter()
+    model = SentenceTransformer(_MODEL_NAME)
+    load_time = time.perf_counter() - t0
 
     def _load(prefix):
-        emb  = np.load(os.path.join(emb_dir, f"{prefix}_embeddings.npy"))
-        with open(os.path.join(emb_dir, f"{prefix}_docs.json"), encoding="utf-8") as f:
+        npy_path = os.path.join(emb_dir, f"{prefix}_embeddings{_MODEL_SUFFIX}.npy")
+        if not os.path.exists(npy_path):
+            raise FileNotFoundError(
+                f"索引檔不存在：{npy_path}\n"
+                f"請先執行：python backend/build_index.py\n"
+                f"或設定 EMBED_MODEL=text2vec 使用現有索引"
+            )
+        emb  = np.load(npy_path)
+        with open(os.path.join(emb_dir, f"{prefix}_docs{_MODEL_SUFFIX}.json"), encoding="utf-8") as f:
             data = json.load(f)
         return emb, data["texts"], data["metas"]
 
     law_emb,  law_texts,  law_metas  = _load("law")
     case_emb, case_texts, case_metas = _load("cases")
+
+    dim = law_emb.shape[1]
+    try:
+        import psutil as _ps
+        rss = _ps.Process().memory_info().rss / 1024 ** 2
+        t_enc = time.perf_counter()
+        model.encode(["test"], normalize_embeddings=True)
+        enc_ms = (time.perf_counter() - t_enc) * 1000
+        print(f"[MODEL] {_MODEL_NAME} | dim={dim} | load={load_time:.1f}s | RSS={rss:.0f}MB | encode={enc_ms:.0f}ms", flush=True)
+    except ImportError:
+        print(f"[MODEL] {_MODEL_NAME} | dim={dim} | load={load_time:.1f}s", flush=True)
+    print(f"[INDEX] law={len(law_texts)} cases={len(case_texts)} total={len(law_texts)+len(case_texts)}", flush=True)
+
     return model, law_emb, law_texts, law_metas, case_emb, case_texts, case_metas
 
 
@@ -319,16 +353,19 @@ def _build_chroma_collections(client, emb_dir, law_texts, law_metas, case_texts,
     """Populate law_chunks + cases_chunks from existing .npy / .json. No re-encoding."""
     import numpy as np
 
-    def _populate(prefix, texts, metas):
-        emb = np.load(os.path.join(emb_dir, f"{prefix}_embeddings.npy"))
+    def _populate(prefix, col_name, texts, metas):
+        npy_path = os.path.join(emb_dir, f"{prefix}_embeddings{_MODEL_SUFFIX}.npy")
+        if not os.path.exists(npy_path):
+            raise FileNotFoundError(
+                f"索引檔不存在：{npy_path}\n"
+                f"請先執行：python backend/build_index.py"
+            )
+        emb = np.load(npy_path)
         try:
-            client.delete_collection(f"{prefix}_chunks")
+            client.delete_collection(col_name)
         except Exception:
             pass
-        col = client.create_collection(
-            f"{prefix}_chunks",
-            metadata={"hnsw:space": "cosine"},
-        )
+        col = client.create_collection(col_name, metadata={"hnsw:space": "cosine"})
         ids       = [f"{prefix}_{i}" for i in range(len(texts))]
         documents = [m.get("display_text", t) for t, m in zip(texts, metas)]
         metadatas = [_sanitize_meta(t, m) for t, m in zip(texts, metas)]
@@ -341,8 +378,8 @@ def _build_chroma_collections(client, emb_dir, law_texts, law_metas, case_texts,
                 metadatas=metadatas[s:s + BATCH],
             )
 
-    _populate("law",   law_texts,  law_metas)
-    _populate("cases", case_texts, case_metas)
+    _populate("law",   _LAW_COL_NAME,   law_texts,  law_metas)
+    _populate("cases", _CASES_COL_NAME, case_texts, case_metas)
 
 
 @st.cache_resource(show_spinner="正在準備索引…")
@@ -358,7 +395,7 @@ def _load_chroma_index():
     emb_dir = os.path.join(base_dir, "backend", "embeddings")
 
     def _load_json(prefix):
-        with open(os.path.join(emb_dir, f"{prefix}_docs.json"), encoding="utf-8") as f:
+        with open(os.path.join(emb_dir, f"{prefix}_docs{_MODEL_SUFFIX}.json"), encoding="utf-8") as f:
             d = json.load(f)
         return d["texts"], d["metas"]
 
@@ -374,18 +411,18 @@ def _load_chroma_index():
         client   = chromadb.PersistentClient(path=_CHROMA_DB_PATH)
         existing = {c.name for c in client.list_collections()}
 
-        need_build = "law_chunks" not in existing or "cases_chunks" not in existing
+        need_build = _LAW_COL_NAME not in existing or _CASES_COL_NAME not in existing
         if not need_build:
-            law_tmp   = client.get_collection("law_chunks")
-            cases_tmp = client.get_collection("cases_chunks")
+            law_tmp   = client.get_collection(_LAW_COL_NAME)
+            cases_tmp = client.get_collection(_CASES_COL_NAME)
             if law_tmp.count() != len(law_texts) or cases_tmp.count() != len(case_texts):
                 need_build = True
 
         if need_build:
             _build_chroma_collections(client, emb_dir, law_texts, law_metas, case_texts, case_metas)
 
-        law_col   = client.get_collection("law_chunks")
-        cases_col = client.get_collection("cases_chunks")
+        law_col   = client.get_collection(_LAW_COL_NAME)
+        cases_col = client.get_collection(_CASES_COL_NAME)
         return law_col, cases_col
 
     # First attempt (no rebuild)
@@ -403,7 +440,22 @@ def _load_chroma_index():
             print(f"[CHROMA] 重建仍失敗，退回 NumPy 路徑：{e2}", flush=True)
             return None  # caller detects None and uses numpy
 
-    model = SentenceTransformer("shibing624/text2vec-base-chinese")
+    import time as _time
+    t0 = _time.perf_counter()
+    model = SentenceTransformer(_MODEL_NAME)
+    load_time = _time.perf_counter() - t0
+    t_enc = _time.perf_counter()
+    sample = model.encode(["test"], normalize_embeddings=True)
+    enc_ms = (_time.perf_counter() - t_enc) * 1000
+    dim = sample.shape[1]
+    try:
+        import psutil as _ps
+        rss = _ps.Process().memory_info().rss / 1024 ** 2
+        print(f"[MODEL] {_MODEL_NAME} | dim={dim} | load={load_time:.1f}s | RSS={rss:.0f}MB | encode={enc_ms:.0f}ms", flush=True)
+    except ImportError:
+        print(f"[MODEL] {_MODEL_NAME} | dim={dim} | load={load_time:.1f}s | encode={enc_ms:.0f}ms", flush=True)
+    print(f"[INDEX] law={law_col.count()} cases={cases_col.count()} total={law_col.count()+cases_col.count()}", flush=True)
+
     return model, law_col, cases_col, law_texts, law_metas, case_texts, case_metas
 
 

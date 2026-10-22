@@ -2,16 +2,24 @@
 預先計算所有 embedding 並存成 numpy 檔案。
 只需執行一次：python backend/build_index.py
 
-改動重點（v2）：
-  1. embed_text = 來源標籤 + chunk（≤95字，約100 tokens，低於 max_seq_length=128）
-  2. display_text 與 embed_text 分開：向量化用截斷，顯示用完整原文 / 主文+鄰近chunk
-  3. 長文件切塊（CHUNK_SIZE=80字，重疊12字），每塊記錄 parent_id 和 chunk_idx
-  4. 檢索後在 app.py 以 parent_id 合併，取回 display_text 給 Gemini
+模型選擇（環境變數 EMBED_MODEL，預設 bge-m3）：
+  bge-m3   → BAAI/bge-m3（1024 dim）；輸出 *_bgem3.npy / *_docs_bgem3.json
+  text2vec → shibing624/text2vec-base-chinese（768 dim）；輸出 *.npy / *_docs.json（原路徑）
+
+切塊策略（bge-m3）：
+  法條：一條一塊；超過 LAW_MAX_CHARS 才再切，保留條號與來源標籤。
+  案例：約 CASE_MAX_CHARS 字一塊，CASE_OVERLAP 字重疊，在句號/段落處切割。
+  embed_text = display_text（不再分開存），標籤前置。
+
+切回 text2vec：
+  EMBED_MODEL=text2vec python backend/build_index.py
+  再重啟 Streamlit 並設 EMBED_MODEL=text2vec（app.py 自動選對應索引檔）。
 """
 
 import json
 import os
 import re
+import time
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
@@ -19,11 +27,25 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR  = os.path.join(BASE_DIR, "embeddings")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-MODEL_NAME         = "shibing624/text2vec-base-chinese"
-CHUNK_SIZE         = 80   # 內容字元數；加上標籤共約 95字 ≈ 100 tokens
-CHUNK_OVERLAP      = 12   # 重疊字元數，讓跨塊語意不斷裂
-LABEL_MAX          = 15   # 來源標籤最大字元數（含【】）
-MAX_CHUNKS_PER_DOC = 50   # 單篇文件 chunk 上限，防止超大文件（如 15325 字）佔滿索引
+# ── 模型選擇 ─────────────────────────────────────────────────────────────────
+EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3").lower()
+if "text2vec" in EMBED_MODEL:
+    MODEL_NAME  = "shibing624/text2vec-base-chinese"
+    FILE_SUFFIX = ""
+else:
+    MODEL_NAME  = "BAAI/bge-m3"
+    FILE_SUFFIX = "_bgem3"
+
+# ── 切塊參數 ─────────────────────────────────────────────────────────────────
+LAW_MAX_CHARS      = 500   # 法條：超過此長度才切塊
+CASE_MAX_CHARS     = 400   # 案例：目標每塊字元數
+CASE_OVERLAP       = 50    # 案例：重疊字元數
+MAX_CHUNKS_PER_DOC = 50    # 每份文件最多切幾塊
+
+# ── 舊版切塊參數（text2vec 路徑用）─────────────────────────────────────────
+CHUNK_SIZE_LEGACY    = 80
+CHUNK_OVERLAP_LEGACY = 12
+LABEL_MAX            = 15
 
 CASE_FILES = [
     "taipei_cases.json",
@@ -44,70 +66,97 @@ def load_json(filename):
         return json.load(f)
 
 
-def make_chunks(text):
-    """將 text 切成 CHUNK_SIZE 字、重疊 CHUNK_OVERLAP 字的片段。
-    回傳 (chunks, starts)：chunks 為字串列表，starts 為各塊起始位置。"""
+def smart_split(text, max_chars, overlap):
+    """在句號/段落邊界切割中文文字，每塊約 max_chars 字，重疊 overlap 字。"""
+    if len(text) <= max_chars:
+        return [text]
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + max_chars, len(text))
+        if end < len(text):
+            # 從後往前找最近的句子邊界
+            for b in ['。', '；', '！', '？', '\n']:
+                pos = text.rfind(b, start + max_chars // 3, end)
+                if pos != -1:
+                    end = pos + 1
+                    break
+        chunks.append(text[start:end])
+        if end >= len(text):
+            break
+        start = max(start + 1, end - overlap)
+    return chunks
+
+
+# ── 舊版工具（text2vec） ──────────────────────────────────────────────────────
+
+def _make_chunks_legacy(text):
     chunks, starts = [], []
     start = 0
     while start < len(text):
-        end = min(start + CHUNK_SIZE, len(text))
+        end = min(start + CHUNK_SIZE_LEGACY, len(text))
         chunks.append(text[start:end])
         starts.append(start)
         if end == len(text):
             break
-        start += CHUNK_SIZE - CHUNK_OVERLAP
+        start += CHUNK_SIZE_LEGACY - CHUNK_OVERLAP_LEGACY
     return chunks, starts
 
 
-def make_label(source, extra=""):
-    """製作來源標籤，截斷到 LABEL_MAX 字。"""
+def _make_label(source, extra=""):
     raw = f"【{source}{' ' + extra if extra else ''}】"
     return raw[:LABEL_MAX]
 
 
-def extract_main_text(content):
-    """
-    從判決書 content 中抽出主文（到「理由」段落前）。
-    使用 negative lookbehind 排除「有/無/其/此/查」前綴的「理由」，
-    並要求「理由」後接「：」「:」「\\n」「壹」才算段落分隔，
-    避免「此部分無理由」「本院查理由」等誤判。
-    """
+def _extract_main_text(content):
     m = re.search(r'(?<![有無其此查])理由[：:\n壹]', content)
     if m:
         return content[:m.start()].strip()
-    return ""   # 找不到則回傳空字串，display_text 只用鄰近 chunks
+    return ""
 
 
 # ==========================================
 # 法條索引建構
 # ==========================================
 
-def build_law_chunks(laws):
-    """
-    每條條文切塊。
-    - embed_text  = 標籤 + chunk（向量化用）
-    - display_text = 完整條文原文（Gemini 顯示用；法條不做主文/理由分割）
-    """
+def build_law_chunks_legacy(laws):
     embed_texts, metas = [], []
     for item in laws:
         source     = item.get("source", "勞動基準法")
         article_no = item.get("article_no", "")
         full_text  = item.get("text", "")
-        label      = make_label(source, article_no)
+        label      = _make_label(source, article_no)
         parent_id  = f"law_{article_no}"
+        raw_chunks, _ = _make_chunks_legacy(full_text)
+        for idx, chunk in enumerate(raw_chunks[:MAX_CHUNKS_PER_DOC]):
+            embed_texts.append(label + chunk)
+            metas.append({
+                "article_no": article_no, "source": source,
+                "parent_id": parent_id, "chunk_idx": idx,
+                "display_text": full_text,
+            })
+    return embed_texts, metas
 
-        raw_chunks, _ = make_chunks(full_text)
-        raw_chunks = raw_chunks[:MAX_CHUNKS_PER_DOC]
 
-        for idx, chunk in enumerate(raw_chunks):
-            embed_text = label + chunk
-            embed_texts.append(embed_text)
+def build_law_chunks_bgem3(laws):
+    """一條一塊；超過 LAW_MAX_CHARS 才再切，embed_text = display_text。"""
+    embed_texts, metas = [], []
+    for item in laws:
+        source     = item.get("source", "勞動基準法")
+        article_no = item.get("article_no", "")
+        full_text  = item.get("text", "")
+        label      = f"【{source} {article_no}】"
+        parent_id  = f"law_{article_no}"
+        merged     = f"{label}\n{full_text}"
+        chunks     = smart_split(merged, LAW_MAX_CHARS, overlap=50)
+        for idx, chunk in enumerate(chunks[:MAX_CHUNKS_PER_DOC]):
+            embed_texts.append(chunk)
             metas.append({
                 "article_no"  : article_no,
                 "source"      : source,
                 "parent_id"   : parent_id,
                 "chunk_idx"   : idx,
-                "display_text": full_text,   # 完整條文
+                "display_text": chunk,
             })
     return embed_texts, metas
 
@@ -116,12 +165,7 @@ def build_law_chunks(laws):
 # 案例索引建構
 # ==========================================
 
-def build_case_chunks(case_files):
-    """
-    每筆案例切塊。
-    - embed_text  = 標籤 + chunk
-    - display_text = 主文（若找到）+ 命中 chunk 及其前後各一 chunk
-    """
+def build_case_chunks_legacy(case_files):
     embed_texts, metas = [], []
     for fn in case_files:
         items = load_json(fn)
@@ -134,26 +178,44 @@ def build_case_chunks(case_files):
             content  = item.get("content", "").strip()
             if not content:
                 continue
-
-            label     = make_label(f"{source[:7]}-{category[:6]}")
+            label     = _make_label(f"{source[:7]}-{category[:6]}")
             parent_id = f"{fn.replace('.json', '')}_{doc_idx}"
-            main_text = extract_main_text(content)
-
-            raw_chunks, _ = make_chunks(content)
-            raw_chunks = raw_chunks[:MAX_CHUNKS_PER_DOC]
-
-            for idx, chunk in enumerate(raw_chunks):
-                embed_text = label + chunk
-
-                # display_text = 主文 + (前一塊 + 本塊 + 後一塊)
-                window = raw_chunks[max(0, idx - 1) : idx + 2]
+            main_text = _extract_main_text(content)
+            raw_chunks, _ = _make_chunks_legacy(content)
+            for idx, chunk in enumerate(raw_chunks[:MAX_CHUNKS_PER_DOC]):
+                window = raw_chunks[max(0, idx - 1):idx + 2]
                 context = "".join(window)
-                if main_text and main_text not in context:
-                    display_text = main_text + "\n" + context
-                else:
-                    display_text = context
+                display_text = (main_text + "\n" + context) if (main_text and main_text not in context) else context
+                embed_texts.append(label + chunk)
+                metas.append({
+                    "source": source, "category": category, "title": title,
+                    "url": url, "parent_id": parent_id, "chunk_idx": idx,
+                    "display_text": display_text,
+                })
+    return embed_texts, metas
 
-                embed_texts.append(embed_text)
+
+def build_case_chunks_bgem3(case_files):
+    """約 CASE_MAX_CHARS 字一塊，CASE_OVERLAP 字重疊，在句號/段落邊界切割。
+    embed_text = display_text（合併，不再分開）。"""
+    embed_texts, metas = [], []
+    for fn in case_files:
+        items = load_json(fn)
+        print(f"  {fn}：{len(items)} 筆")
+        for doc_idx, item in enumerate(items):
+            source   = item.get("source", "")
+            category = item.get("category", "")
+            title    = item.get("title", "").strip()
+            url      = item.get("url", "")
+            content  = item.get("content", "").strip()
+            if not content:
+                continue
+            label     = f"【{source} {category}】"
+            parent_id = f"{fn.replace('.json', '')}_{doc_idx}"
+            chunks    = smart_split(content, CASE_MAX_CHARS, CASE_OVERLAP)
+            for idx, chunk in enumerate(chunks[:MAX_CHUNKS_PER_DOC]):
+                merged = f"{label}\n{chunk}"
+                embed_texts.append(merged)
                 metas.append({
                     "source"      : source,
                     "category"    : category,
@@ -161,7 +223,7 @@ def build_case_chunks(case_files):
                     "url"         : url,
                     "parent_id"   : parent_id,
                     "chunk_idx"   : idx,
-                    "display_text": display_text,
+                    "display_text": merged,
                 })
     return embed_texts, metas
 
@@ -171,15 +233,19 @@ def build_case_chunks(case_files):
 # ==========================================
 
 def encode_and_save(model, texts, metas, prefix):
+    t0 = time.perf_counter()
     print(f"  計算 embedding（共 {len(texts)} 筆）...")
     embeddings = model.encode(
-        texts, batch_size=64, show_progress_bar=True,
+        texts, batch_size=32, show_progress_bar=True,
         convert_to_numpy=True, normalize_embeddings=True,
     )
-    np.save(os.path.join(OUT_DIR, f"{prefix}_embeddings.npy"), embeddings)
-    with open(os.path.join(OUT_DIR, f"{prefix}_docs.json"), "w", encoding="utf-8") as f:
+    elapsed = time.perf_counter() - t0
+    out_prefix = f"{prefix}{FILE_SUFFIX}"
+    np.save(os.path.join(OUT_DIR, f"{out_prefix}_embeddings.npy"), embeddings)
+    with open(os.path.join(OUT_DIR, f"{out_prefix}_docs.json"), "w", encoding="utf-8") as f:
         json.dump({"texts": texts, "metas": metas}, f, ensure_ascii=False)
-    print(f"  已儲存：embeddings/{prefix}_*  shape={embeddings.shape}")
+    print(f"  已儲存：embeddings/{out_prefix}_*  shape={embeddings.shape}  time={elapsed:.1f}s")
+    return elapsed
 
 
 # ==========================================
@@ -187,18 +253,48 @@ def encode_and_save(model, texts, metas, prefix):
 # ==========================================
 
 if __name__ == "__main__":
-    print(f"載入模型：{MODEL_NAME}")
+    import psutil
+    proc = psutil.Process()
+
+    print(f"EMBED_MODEL : {EMBED_MODEL}")
+    print(f"MODEL_NAME  : {MODEL_NAME}")
+    print(f"FILE_SUFFIX : '{FILE_SUFFIX}'")
+
+    rss_before = proc.memory_info().rss / 1024 ** 2
+    t_load = time.perf_counter()
+    print(f"\n載入模型：{MODEL_NAME}")
     model = SentenceTransformer(MODEL_NAME)
+    load_time = time.perf_counter() - t_load
+    rss_after = proc.memory_info().rss / 1024 ** 2
 
-    print("\n[1/2] 勞基法本法 + 施行細則")
+    sample = model.encode(["test"], normalize_embeddings=True)
+    dim = sample.shape[1]
+    print(f"維度：{dim} | 載入時間：{load_time:.1f}s | 記憶體增加：{rss_after - rss_before:.0f}MB")
+
+    t_enc = time.perf_counter()
+    _ = model.encode(["休息日加班費怎麼計算"], normalize_embeddings=True)
+    enc_ms = (time.perf_counter() - t_enc) * 1000
+    print(f"單句編碼時間：{enc_ms:.1f}ms")
+
+    t_total = time.perf_counter()
+
+    print(f"\n[1/2] 勞基法本法 + 施行細則")
     laws = load_json("labor_law_cleaned.json") + load_json("labor_law_rules_cleaned.json")
-    law_texts, law_metas = build_law_chunks(laws)
+    if "text2vec" in EMBED_MODEL:
+        law_texts, law_metas = build_law_chunks_legacy(laws)
+    else:
+        law_texts, law_metas = build_law_chunks_bgem3(laws)
     print(f"  法條 chunk 數：{len(law_texts)}")
-    encode_and_save(model, law_texts, law_metas, "law")
+    law_elapsed = encode_and_save(model, law_texts, law_metas, "law")
 
-    print("\n[2/2] 案例 / Q&A / 裁判書")
-    case_texts, case_metas = build_case_chunks(CASE_FILES)
+    print(f"\n[2/2] 案例 / Q&A / 裁判書")
+    if "text2vec" in EMBED_MODEL:
+        case_texts, case_metas = build_case_chunks_legacy(CASE_FILES)
+    else:
+        case_texts, case_metas = build_case_chunks_bgem3(CASE_FILES)
     print(f"  案例 chunk 數：{len(case_texts)}")
-    encode_and_save(model, case_texts, case_metas, "cases")
+    case_elapsed = encode_and_save(model, case_texts, case_metas, "cases")
 
-    print("\n完成！請執行 streamlit run Fronted/app.py")
+    total_elapsed = time.perf_counter() - t_total
+    print(f"\n完成！總建索引時間：{total_elapsed:.1f}s（法條：{law_elapsed:.1f}s，案例：{case_elapsed:.1f}s）")
+    print("執行：streamlit run Fronted/app.py")

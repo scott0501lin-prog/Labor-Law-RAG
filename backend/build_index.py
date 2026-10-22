@@ -240,11 +240,10 @@ def encode_and_save(model, texts, metas, prefix):
         convert_to_numpy=True, normalize_embeddings=True,
     )
     elapsed = time.perf_counter() - t0
-    out_prefix = f"{prefix}{FILE_SUFFIX}"
-    np.save(os.path.join(OUT_DIR, f"{out_prefix}_embeddings.npy"), embeddings)
-    with open(os.path.join(OUT_DIR, f"{out_prefix}_docs.json"), "w", encoding="utf-8") as f:
+    np.save(os.path.join(OUT_DIR, f"{prefix}_embeddings{FILE_SUFFIX}.npy"), embeddings)
+    with open(os.path.join(OUT_DIR, f"{prefix}_docs{FILE_SUFFIX}.json"), "w", encoding="utf-8") as f:
         json.dump({"texts": texts, "metas": metas}, f, ensure_ascii=False)
-    print(f"  已儲存：embeddings/{out_prefix}_*  shape={embeddings.shape}  time={elapsed:.1f}s")
+    print(f"  已儲存：embeddings/{prefix}_*{FILE_SUFFIX}  shape={embeddings.shape}  time={elapsed:.1f}s")
     return elapsed
 
 

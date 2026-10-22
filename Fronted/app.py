@@ -96,6 +96,8 @@ defaults = {
     # intent-detection state (reset when a complete RAG answer is given)
     "intent_ctx": None,    # dict with original_query/translated_query/scenario/known_info
     "followup_count": 0,   # number of follow-up rounds completed in current dialog
+    "_pending_cases": None,  # list[(text, meta, score)] from last RAG query; shown on button click
+    "_show_cases": False,    # whether the case panel is expanded
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -513,6 +515,7 @@ from force_rules import (
     _force_include_articles,
     _force_include_cases,
 )
+from referral_text import REFERRAL_BLOCK, OUT_OF_SCOPE_NOTE
 
 
 # ==========================================
@@ -820,22 +823,20 @@ def query_rag_system(
 
         law_ctx = ""
         for d, m, _ in l_results:
-            display = m.get("display_text", d)   # 完整條文；舊索引 fallback 用 embed chunk
+            display = m.get("display_text", d)
             law_ctx += f"【法規內容】：{display}\n【條號】：{m.get('source', '')} {m.get('article_no', '')}\n\n"
 
-        case_ctx = ""
-        for d, m, _ in c_results:
-            display  = m.get("display_text", d)  # 主文+鄰近chunk；舊索引 fallback 用 embed chunk
-            url_line = f"\n【網址】：{m['url']}" if m.get("url") else ""
-            case_ctx += f"【{m.get('source', '')} — {m.get('category', '')}】\n{display}{url_line}\n\n"
+        # c_results are saved to session_state for the "查看相似案例" button;
+        # they are NOT included in the Gemini prompt (saves tokens).
+        st.session_state["_pending_cases"] = c_results
+        st.session_state["_show_cases"]    = False
 
         # 回答語言邏輯：永遠跟著 UI 語言選項走。
-        # 使用者在語言下拉選 English → AI 用英文回答，以此類推。
         if ui_lang != "繁體中文":
             lang_name = LANGUAGES.get(ui_lang, "Traditional Chinese")
             lang_rule = (
-                f"\n8. 除「📖 法條依據」區塊中的法條原文須保留繁體中文（避免翻譯造成法律歧義）外，"
-                f"其餘所有文字（結論、📂 參考案例、💡 說明）請使用「{lang_name}」撰寫；"
+                f"\n6. 除「### 法條依據」中的法條原文須保留繁體中文（避免翻譯造成法律歧義）外，"
+                f"其餘所有文字請使用「{lang_name}」撰寫；"
                 f"法條原文後方請附上一句{lang_name}白話翻譯。"
                 f"加班費倍率的數字（如 4/3、5/3、1.33、1.66）必須維持原本數值與格式，不可換算。"
             )
@@ -860,38 +861,53 @@ def query_rag_system(
 【相關法規條文】（資料庫檢索）：
 {law_ctx}
 
-【相關案例 / Q&A / 裁判書】（資料庫檢索）：
-{case_ctx}
-
 使用者問題：{user_prompt}
 
 【回答格式要求】：
-1. 先給出簡明的直接結論。
-2. 在「📖 法條依據」區塊中，逐條列出引用的法條號碼與原文：
-   > **勞動基準法 第 X 條**
-   > （條文原文）
-3. 在「📂 參考案例」區塊中，若有相關案例或 Q&A，請摘要說明並附上來源網址（可點擊連結）。
-4. 在「💡 說明」區塊中，依據以上資料說明理由與注意事項。
-5. 若資料庫無相關條文或案例，須明確說明，不可捏造。
-6. 若回答涉及加班費倍率計算（例如平日延長工時前 2 小時為 1 又 1/3 倍〈4/3，約 1.33 倍〉、
-   超過 2 小時至 4 小時為 1 又 2/3 倍〈5/3，約 1.66 倍〉），必須同時列出精確分數與約略小數
-   （例如「4/3 倍（約 1.33 倍）」），不可只寫約略小數，也不可寫成「多 33%」等容易誤解為
-   百分比加成的說法；並清楚說明此倍率是以平日每小時工資額為計算基準。
-7. 若問題涉及「依年資對應天數／期間／金額」的法條級距（例如特別休假天數、資遣預告期間、
-   資遣費／退休金計算等），作答前必須先明確判斷使用者的年資落在哪一款／哪一個級距，
-   全文只能使用該款對應的數字；「結論」與「📖 法條依據」引用的級距與數字必須完全一致，
-   不可一邊寫某一級距的天數、另一邊卻引用其他級距的法條。若年資剛好落在級距交界（例如
-   「剛滿」某年），須以該年資對應的較低級距（未滿下一級距）計算，並可在「💡 說明」中
-   註明何時會晉升到下一級距。{lang_rule}{missing_note}
+1. 只輸出以下兩個部分，不要加其他區塊：
+
+   ### 結論與做法
+   先用一到兩句話直接回答，再列出具體步驟或試算。
+   - 語氣用「依法規定」或「依你提供的資料估算」，不要寫成最終判定。
+   - 加班費情境：提到雇主可能提供「補休」選項；說明「加給三分之一，合計為平日 4/3 倍（約 1.33 倍）」；
+     第 32 條只說與本問題相關的工時上限，不需展開全文。
+   - 若資料不足，明說不足之處，不要猜測數字。
+
+   ### 法條依據
+   逐條列出條號與重點。只能引用上方提供的條文，不得憑記憶補充其他條文。
+   若資料庫中沒有相關條文，直接寫「資料庫中沒有相關條文」。
+
+2. 加班費倍率必須同時列出精確分數與約略小數（例如「4/3 倍（約 1.33 倍）」），
+   不可只寫約略小數，也不可寫成「多 33%」；倍率以平日每小時工資額為計算基準。
+
+3. 若問題涉及依年資對應的法條級距（特別休假、資遣預告期間、資遣費等），
+   先判斷使用者年資落在哪一款，全文只用該款數字；「結論」與「法條依據」引用的級距必須一致。
+
+4. 若問題完全超出勞動基準法與施行細則範圍（例如性別平等工作法、公司法等），
+   在最前面單獨輸出「[OOS]」（四個字元加括號），其餘照常簡短回答。
+
+5. 若資料庫中沒有相關條文，須明確說明，不可捏造條號。{lang_rule}{missing_note}
 """
         _t_prompt = time.perf_counter()
 
+        # Disable thinking (budget=0) to reduce latency on Flash
+        _thinking_kwargs: dict = {}
+        if hasattr(types, "ThinkingConfig"):
+            _thinking_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=final_prompt,
-            config=types.GenerateContentConfig(system_instruction=system_prompt),
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                **_thinking_kwargs,
+            ),
         )
         _t_gemini = time.perf_counter()
+
+        # Token usage
+        _usage         = getattr(response, "usage_metadata", None)
+        _thinking_tok  = int(getattr(_usage, "thoughts_token_count",    0) or 0)
+        _output_tok    = int(getattr(_usage, "candidates_token_count",  0) or 0)
 
         _rag_logger.info(
             f"q={user_prompt[:25]!r} zh={_is_chinese(user_prompt)} "
@@ -903,10 +919,20 @@ def query_rag_system(
             f"force_c={_t_force_c-_t_case_search:.3f}s "
             f"prompt={_t_prompt-_t_force_c:.3f}s "
             f"gemini={_t_gemini-_t_prompt:.3f}s "
-            f"total={_t_gemini-_t0:.3f}s"
+            f"total={_t_gemini-_t0:.3f}s "
+            f"prompt_chars={len(final_prompt)} "
+            f"thinking_tok={_thinking_tok} output_tok={_output_tok}"
         )
 
-        return response.text
+        answer = response.text or ""
+
+        # Detect out-of-scope marker and format accordingly
+        oos_prefix = ""
+        if answer.lstrip().startswith("[OOS]"):
+            answer    = answer.lstrip().removeprefix("[OOS]").lstrip()
+            oos_prefix = OUT_OF_SCOPE_NOTE
+
+        return oos_prefix + answer + REFERRAL_BLOCK
 
     except Exception as e:
         return f"🚨 異常：{str(e)}"
@@ -1024,6 +1050,29 @@ def show_landing_page():
     st.caption(t(lang, "landing_caption").format(username=st.session_state.username))
 
 
+def _render_case_results(c_results: list, lang: str) -> None:
+    """Render similar-case cards below the answer. Called only when user clicks the button."""
+    st.markdown("---")
+    st.markdown("**🔍 相似案例** *(案例僅供參考，每件情況不同)*")
+    if not c_results:
+        st.info("未找到相似案例。")
+        return
+    for text, meta, score in c_results:
+        title    = meta.get("title") or ""
+        source   = meta.get("source") or ""
+        category = meta.get("category") or ""
+        display  = meta.get("display_text", text)
+        summary  = display[:150] + ("…" if len(display) > 150 else "")
+        url      = meta.get("url") or ""
+        header   = title or f"{source} — {category}"
+        with st.expander(f"📄 {header}", expanded=False):
+            if source or category:
+                st.markdown(f"**類別**：{source}{'  —  ' + category if category else ''}")
+            st.markdown(summary)
+            if url:
+                st.markdown(f"[🔗 查看原文]({url})")
+
+
 # ==========================================
 # 6. 頁面三：AI 聊天室 (Chat Room)
 # ==========================================
@@ -1035,10 +1084,9 @@ def show_chat_room():
         title   = t(lang, "chat_title_employee")
         persona = (
             "你是一位專業勞工法律顧問，專門協助勞工了解並保護自身的勞動權益。"
-            "你具備深厚的台灣勞動法律知識，包括勞動基準法、勞工保險條例、職業安全衛生法等。"
+            "你具備深厚的台灣勞動法律知識，包括勞動基準法及其施行細則。"
             "請以友善、清晰、易懂的語氣回答問題。"
-            "回答時必須：①先給結論，②在「📖 法條依據」區塊逐條引用法條號碼與原文，"
-            "③在「💡 說明」區塊解釋理由。若資料庫無相關條文，須明確說明，不可捏造條號。"
+            "只引用資料庫提供的條文；資料庫中沒有的條文，不得憑記憶補充。"
         )
         btns = [
             (t(lang, "qe_btn1"), "我被資遣了！我的權益是什麼？"),
@@ -1052,8 +1100,7 @@ def show_chat_room():
             "你是一位專業企業勞動法律顧問，專門協助雇主和HR在合法合規的前提下管理勞資關係。"
             "你具備深厚的台灣勞動法律知識，並能從企業管理角度提供實用建議。"
             "請以專業、嚴謹的語氣回答。"
-            "回答時必須：①先給結論，②在「📖 法條依據」區塊逐條引用法條號碼與原文，"
-            "③在「💡 說明」區塊解釋理由與風險評估。若資料庫無相關條文，須明確說明，不可捏造條號。"
+            "只引用資料庫提供的條文；資料庫中沒有的條文，不得憑記憶補充。"
         )
         btns = [
             (t(lang, "qr_btn1"), "合法資遣流程？"),
@@ -1073,17 +1120,23 @@ def show_chat_room():
         if st.button(t(lang, "btn_new_chat"), use_container_width=True):
             st.session_state.messages        = []
             st.session_state.current_chat_id = None
+            st.session_state["_pending_cases"] = None
+            st.session_state["_show_cases"]    = False
             st.rerun()
 
         if st.button(t(lang, "btn_switch_role"), use_container_width=True):
             st.session_state.page            = "Landing"
             st.session_state.messages        = []
             st.session_state.current_chat_id = None
+            st.session_state["_pending_cases"] = None
+            st.session_state["_show_cases"]    = False
             st.rerun()
 
         if st.button(t(lang, "btn_logout"), use_container_width=True):
             for k in ["logged_in", "username", "user_role", "messages", "current_chat_id"]:
                 st.session_state[k] = defaults[k]
+            st.session_state["_pending_cases"] = None
+            st.session_state["_show_cases"]    = False
             st.session_state.page = "Login"
             st.rerun()
 
@@ -1126,12 +1179,30 @@ def show_chat_room():
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
+    # ── 「查看相似案例」按鈕（出現在最後一則 AI 回答之後）──
+    _has_cases = bool(st.session_state.get("_pending_cases"))
+    _last_is_assistant = (
+        bool(st.session_state.messages)
+        and st.session_state.messages[-1]["role"] == "assistant"
+    )
+    if _has_cases and _last_is_assistant:
+        if not st.session_state.get("_show_cases"):
+            if st.button("🔍 查看相似案例"):
+                st.session_state["_show_cases"] = True
+                st.rerun()
+        else:
+            _render_case_results(st.session_state["_pending_cases"], lang)
+
     prompt = st.chat_input(t(lang, "chat_input_placeholder"))
     if st.session_state.btn_input:
         prompt = st.session_state.btn_input
         st.session_state.btn_input = None
 
     if prompt:
+        # Clear previous case results when a new question is submitted
+        st.session_state["_pending_cases"] = None
+        st.session_state["_show_cases"]    = False
+
         with st.chat_message("user"):
             st.markdown(prompt)
         st.session_state.messages.append({"role": "user", "content": prompt})

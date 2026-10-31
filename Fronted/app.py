@@ -4,6 +4,7 @@ import uuid
 import time
 import logging
 from datetime import timezone
+from typing import Iterator
 
 # sqlite3 swap for Linux (Chroma requires SQLite >= 3.35; Ubuntu 20.04 ships 3.31)
 # Must run before any 'import chromadb' anywhere in this process.
@@ -56,12 +57,24 @@ _CASES_COL_NAME = f"cases_chunks{_MODEL_SUFFIX}"
 
 
 def _resolve_chroma_path() -> str:
-    """Return writable path for ChromaDB; falls back to tempdir if preferred path fails."""
+    """Return writable path for ChromaDB; falls back to tempdir if preferred path fails.
+
+    Chroma's native HNSW writer can't handle non-ASCII paths on Windows (e.g. a
+    project under "新增資料夾"): it silently writes no index files, so every
+    restart hits "Error loading hnsw index" and rebuilds. Such paths are
+    redirected to an ASCII directory under LOCALAPPDATA.
+    """
     import tempfile
     preferred = os.getenv(
         "CHROMA_DB_PATH",
         os.path.join(base_dir, "backend", "chroma_db"),
     )
+    if not preferred.isascii():
+        fallback = os.path.join(
+            os.getenv("LOCALAPPDATA") or os.path.expanduser("~"), "law_rag", "chroma_db"
+        )
+        print(f"[CHROMA] 路徑含非 ASCII 字元，改用：{fallback}", flush=True)
+        preferred = fallback
     try:
         os.makedirs(preferred, exist_ok=True)
         probe = os.path.join(preferred, ".write_probe")
@@ -109,6 +122,24 @@ def inject_css():
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700&family=Inter:wght@400;500;600&display=swap');
 
+    /* ── 色票（墨綠 + 燕麥） ── */
+    :root {
+        --green-900: #0f2318;
+        --green-800: #1a3a28;
+        --green-700: #24512f;  /* sidebar hover */
+        --green-600: #2d6a3f;
+        --green-500: #3d8a55;
+        --oat-100:   #faf8f4;  /* 最淺燕麥 */
+        --oat-200:   #f3ede0;  /* 主背景 */
+        --oat-300:   #e6dece;  /* 分隔 / border */
+        --oat-400:   #c9bfa8;  /* 次要 border */
+        --oat-600:   #7a6e58;  /* 次要文字 */
+        --oat-900:   #1e1a14;  /* 主文字 */
+        --accent:    #8b6c2a;  /* 金銅色 accent */
+        --accent-lt: #c9a84c;  /* 金色高亮 */
+        --white:     #ffffff;
+    }
+
     html, body, .stApp {
         font-family: 'Noto Sans TC', 'Inter', -apple-system, sans-serif !important;
     }
@@ -117,12 +148,13 @@ def inject_css():
     #MainMenu, footer { visibility: hidden; }
     .stDeployButton { display: none !important; }
 
-    /* 主背景 */
-    .stApp { background: #f0f4f8; }
+    /* ── 主背景（燕麥色） ── */
+    .stApp { background: var(--oat-200) !important; }
 
-    /* ── 側邊欄 ── */
+    /* ── 側邊欄（墨綠漸層） ── */
     [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #1a2744 0%, #243257 100%) !important;
+        background: linear-gradient(180deg, var(--green-900) 0%, var(--green-800) 100%) !important;
+        border-right: 1px solid rgba(255,255,255,0.06) !important;
     }
     [data-testid="stSidebar"] p,
     [data-testid="stSidebar"] span,
@@ -131,15 +163,15 @@ def inject_css():
     [data-testid="stSidebar"] h1,
     [data-testid="stSidebar"] h2,
     [data-testid="stSidebar"] h3 {
-        color: #dde3f0 !important;
+        color: #d4e8da !important;
     }
     section[data-testid="stSidebar"] button,
     section[data-testid="stSidebar"] .stButton > button,
     section[data-testid="stSidebar"] div[data-testid="stButton"] > button {
-        background-color: #1e3060 !important;
-        background: #1e3060 !important;
-        color: #dde3f0 !important;
-        border: 1px solid rgba(255,255,255,0.15) !important;
+        background-color: rgba(255,255,255,0.07) !important;
+        background: rgba(255,255,255,0.07) !important;
+        color: #d4e8da !important;
+        border: 1px solid rgba(255,255,255,0.12) !important;
         border-radius: 8px !important;
         font-size: 0.875rem;
         text-align: left;
@@ -147,92 +179,94 @@ def inject_css():
     }
     section[data-testid="stSidebar"] button:hover,
     section[data-testid="stSidebar"] .stButton > button:hover {
-        background-color: rgba(201,168,76,0.25) !important;
-        background: rgba(201,168,76,0.25) !important;
-        border-color: rgba(201,168,76,0.55) !important;
-        color: #f5e090 !important;
+        background-color: rgba(201,168,76,0.2) !important;
+        background: rgba(201,168,76,0.2) !important;
+        border-color: rgba(201,168,76,0.5) !important;
+        color: #f0d98a !important;
     }
     section[data-testid="stSidebar"] button:focus,
     section[data-testid="stSidebar"] button:active,
     section[data-testid="stSidebar"] .stButton > button:focus,
     section[data-testid="stSidebar"] .stButton > button:active {
-        background-color: #1e3060 !important;
-        background: #1e3060 !important;
-        color: #dde3f0 !important;
+        background-color: rgba(255,255,255,0.07) !important;
+        background: rgba(255,255,255,0.07) !important;
+        color: #d4e8da !important;
         box-shadow: none !important;
     }
     [data-testid="stSidebar"] hr {
-        border-color: rgba(255,255,255,0.1) !important;
+        border-color: rgba(255,255,255,0.08) !important;
     }
 
     /* selectbox in sidebar */
     [data-testid="stSidebar"] [data-baseweb="select"] > div {
-        background: rgba(255,255,255,0.1) !important;
-        border-color: rgba(255,255,255,0.2) !important;
+        background: rgba(255,255,255,0.09) !important;
+        border-color: rgba(255,255,255,0.18) !important;
         border-radius: 8px !important;
-        color: #dde3f0 !important;
+        color: #d4e8da !important;
     }
-    [data-testid="stSidebar"] [data-baseweb="select"] svg { fill: #dde3f0 !important; }
+    [data-testid="stSidebar"] [data-baseweb="select"] svg { fill: #d4e8da !important; }
 
     /* ── 標題 ── */
-    h1 { color: #1a2744 !important; font-weight: 700 !important; letter-spacing: -0.3px; }
-    h2, h3 { color: #243257 !important; font-weight: 600 !important; }
+    h1 { color: var(--green-800) !important; font-weight: 700 !important; letter-spacing: -0.3px; }
+    h2, h3 { color: var(--green-700) !important; font-weight: 600 !important; }
 
     /* ── Tabs ── */
     .stTabs [data-baseweb="tab-list"] {
         gap: 4px;
-        border-bottom: 2px solid #d1dae8;
+        border-bottom: 2px solid var(--oat-300);
         background: transparent;
     }
     .stTabs [data-baseweb="tab"] {
         border-radius: 8px 8px 0 0;
         padding: 0.55rem 1.4rem;
         font-weight: 500;
-        color: #64748b;
+        color: var(--oat-600);
         background: transparent;
     }
     .stTabs [aria-selected="true"] {
-        color: #1a2744 !important;
-        background: white !important;
-        border-top: 3px solid #c9a84c !important;
+        color: var(--green-800) !important;
+        background: var(--oat-100) !important;
+        border-top: 3px solid var(--accent-lt) !important;
         font-weight: 600;
     }
 
     /* ── 輸入框 ── */
     .stTextInput > div > div > input {
         border-radius: 8px !important;
-        border: 1.5px solid #c8d4e3 !important;
+        border: 1.5px solid var(--oat-300) !important;
         padding: 0.55rem 1rem !important;
         font-size: 0.95rem;
-        background: white !important;
+        background: var(--oat-100) !important;
+        color: var(--oat-900) !important;
         transition: border-color 0.18s;
     }
     .stTextInput > div > div > input:focus {
-        border-color: #1a2744 !important;
-        box-shadow: 0 0 0 3px rgba(26,39,68,0.08) !important;
+        border-color: var(--green-600) !important;
+        box-shadow: 0 0 0 3px rgba(45,106,63,0.10) !important;
+        background: var(--white) !important;
     }
 
     /* ── 一般按鈕（主內容區） ── */
     .main .stButton > button {
         border-radius: 8px !important;
         font-weight: 500 !important;
-        border: 1.5px solid #c0ccdd !important;
-        color: #1a2744 !important;
-        background: white !important;
+        border: 1.5px solid var(--oat-300) !important;
+        color: var(--green-800) !important;
+        background: var(--oat-100) !important;
         transition: all 0.18s ease !important;
     }
     .main .stButton > button:hover {
-        background: #1a2744 !important;
-        color: white !important;
-        border-color: #1a2744 !important;
-        box-shadow: 0 4px 14px rgba(26,39,68,0.18) !important;
+        background: var(--green-800) !important;
+        color: var(--oat-100) !important;
+        border-color: var(--green-800) !important;
+        box-shadow: 0 4px 14px rgba(15,35,24,0.20) !important;
         transform: translateY(-1px);
     }
 
     /* ── 表單送出按鈕 ── */
     [data-testid="stFormSubmitButton"] > button {
-        background: linear-gradient(135deg, #1a2744, #2a4080) !important;
-        color: white !important;
+        background: linear-gradient(135deg, var(--green-900), var(--green-700)) !important;
+        color: #d4e8da !important;
         border: none !important;
         border-radius: 8px !important;
         font-weight: 600 !important;
@@ -242,8 +276,8 @@ def inject_css():
         transition: all 0.18s ease !important;
     }
     [data-testid="stFormSubmitButton"] > button:hover {
-        background: linear-gradient(135deg, #243257, #1a2744) !important;
-        box-shadow: 0 6px 20px rgba(26,39,68,0.35) !important;
+        background: linear-gradient(135deg, var(--green-800), var(--green-600)) !important;
+        box-shadow: 0 6px 20px rgba(15,35,24,0.35) !important;
         transform: translateY(-1px);
     }
 
@@ -251,34 +285,75 @@ def inject_css():
     .stAlert { border-radius: 12px !important; }
 
     /* ── 聊天訊息 ── */
-    [data-testid="stChatMessage"] { border-radius: 12px !important; }
+    [data-testid="stChatMessage"] {
+        border-radius: 12px !important;
+        background: var(--oat-100) !important;
+        border: 1px solid var(--oat-300) !important;
+    }
 
     /* ── 分隔線 ── */
-    hr { border-color: #dde3f0 !important; margin: 0.8rem 0 !important; }
+    hr { border-color: var(--oat-300) !important; margin: 0.8rem 0 !important; }
 
     /* ── 登入頁置中 ── */
     .login-wrapper {
         max-width: 440px;
         margin: 0 auto;
         padding: 2.5rem 2rem;
-        background: white;
+        background: var(--oat-100);
         border-radius: 16px;
-        box-shadow: 0 4px 24px rgba(26,39,68,0.10);
+        border: 1px solid var(--oat-300);
+        box-shadow: 0 4px 24px rgba(15,35,24,0.10);
     }
 
     /* ── Landing 身份卡片 ── */
     .role-card {
-        background: white;
+        background: var(--oat-100);
         border-radius: 14px;
         padding: 1.8rem;
-        box-shadow: 0 2px 12px rgba(26,39,68,0.08);
+        box-shadow: 0 2px 12px rgba(15,35,24,0.07);
         border: 2px solid transparent;
         transition: border-color 0.18s, box-shadow 0.18s;
         height: 100%;
     }
-    .role-card:hover { border-color: #c9a84c; box-shadow: 0 6px 24px rgba(26,39,68,0.14); }
-    .role-card h3 { margin-top: 0; font-size: 1.15rem; }
-    .role-card p { color: #4a5568; font-size: 0.92rem; line-height: 1.6; margin-bottom: 1.2rem; }
+    .role-card:hover {
+        border-color: var(--accent-lt);
+        box-shadow: 0 6px 24px rgba(15,35,24,0.13);
+    }
+    .role-card h3 { margin-top: 0; font-size: 1.15rem; color: var(--green-800) !important; }
+    .role-card p { color: var(--oat-600); font-size: 0.92rem; line-height: 1.6; margin-bottom: 1.2rem; }
+
+    /* ── 使用者 / AI 訊息泡泡區別 ── */
+    [data-testid="stChatMessage"][data-testid*="user"] {
+        background: #eef7f0 !important;
+        border-left: 3px solid var(--green-600) !important;
+    }
+    [data-testid="stChatMessage"][data-testid*="assistant"] {
+        background: var(--oat-100) !important;
+        border-left: 3px solid var(--accent-lt) !important;
+    }
+
+    /* ── 聊天輸入框 ── */
+    [data-testid="stChatInput"] textarea {
+        background: var(--oat-100) !important;
+        border: 1.5px solid var(--oat-300) !important;
+        border-radius: 10px !important;
+        color: var(--oat-900) !important;
+    }
+    [data-testid="stChatInput"] textarea:focus {
+        border-color: var(--green-600) !important;
+        box-shadow: 0 0 0 3px rgba(45,106,63,0.10) !important;
+    }
+
+    /* ── expander（案例卡片）── */
+    [data-testid="stExpander"] {
+        background: var(--oat-100) !important;
+        border: 1px solid var(--oat-300) !important;
+        border-radius: 10px !important;
+    }
+    [data-testid="stExpander"] summary {
+        color: var(--green-800) !important;
+        font-weight: 500;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -515,7 +590,15 @@ from force_rules import (
     _force_include_articles,
     _force_include_cases,
 )
-from referral_text import REFERRAL_BLOCK, OUT_OF_SCOPE_NOTE
+from referral_text import REFERRAL_BLOCK
+from prompt_helpers import (
+    OUT_OF_SCOPE_TEXT,
+    build_system_prompt,
+    build_lang_rule,
+    build_missing_note,
+    build_user_prompt,
+    stream_reply,
+)
 
 
 # ==========================================
@@ -524,16 +607,31 @@ from referral_text import REFERRAL_BLOCK, OUT_OF_SCOPE_NOTE
 import json as _json
 import re as _re
 
+# Per-read timeout (also sent as the server-side deadline); normal answers finish in < 6s
+GEMINI_TIMEOUT_MS = 15_000
+# Retry only when the stream fails before any text was shown to the user
+GEMINI_MAX_ATTEMPTS = 2
+
+
+@st.cache_resource
+def _get_genai_client(api_key: str):
+    """Shared Gemini client — building one per request costs ~1s (TLS / httpx setup)."""
+    from google import genai as _genai
+    from google.genai import types as _types
+    return _genai.Client(
+        api_key=api_key,
+        http_options=_types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+    )
+
 
 def _gemini_json_call(prompt_text: str, _label: str = "intent") -> dict | None:
     """Fire a Gemini call and return parsed JSON dict, or None on any failure."""
     try:
-        from google import genai as _genai
         api_key = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
         if not api_key:
             print(f"[INTENT] [{_label}] API key 未設定，略過")
             return None
-        client = _genai.Client(api_key=api_key)
+        client = _get_genai_client(api_key)
         resp = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt_text,
@@ -618,7 +716,7 @@ def _build_enriched_query(translated_query: str, known_info: dict) -> str:
     return "，".join(parts)
 
 
-def _handle_prompt(prompt: str, persona: str, lang: str) -> str:
+def _handle_prompt(prompt: str, persona: str, lang: str) -> str | Iterator[str]:
     """Route a user prompt through intent detection + optional follow-up + RAG.
 
     Falls back to query_rag_system() directly whenever intent detection is
@@ -739,8 +837,10 @@ def query_rag_system(
     *,
     search_query_override: str | None = None,
     missing_fields: list[str] | None = None,
-) -> str:
-    """Run the full RAG pipeline and return a response string.
+) -> str | Iterator[str]:
+    """Run retrieval eagerly, then return a generator that streams the answer.
+
+    Returns a plain string for early errors (missing API key, retrieval failure).
 
     search_query_override: pre-translated Chinese query from _analyze_intent;
         if provided, the internal translation call is skipped.
@@ -749,15 +849,14 @@ def query_rag_system(
         NOT to assume values.
     """
     try:
-        from google import genai
         from google.genai import types
 
         api_key = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
         if not api_key:
             return t(ui_lang, "err_no_api_key")
 
-        client = genai.Client(api_key=api_key)
         _t0 = time.perf_counter()
+        client = _get_genai_client(api_key)
 
         _use_chroma = VECTOR_BACKEND == "chroma"
         if _use_chroma:
@@ -783,7 +882,10 @@ def query_rag_system(
                 try:
                     search_query = client.models.generate_content(
                         model="gemini-2.5-flash",
-                        contents=f"請將以下使用者問題翻譯成繁體中文，只需要輸出翻譯結果，不要加任何說明：\n\n{user_prompt}"
+                        contents=f"請將以下使用者問題翻譯成繁體中文，只需要輸出翻譯結果，不要加任何說明：\n\n{user_prompt}",
+                        config=types.GenerateContentConfig(
+                            thinking_config=types.ThinkingConfig(thinking_budget=0),
+                        ),
                     ).text.strip()
                 except Exception:
                     search_query = user_prompt
@@ -832,80 +934,78 @@ def query_rag_system(
         st.session_state["_show_cases"]    = False
 
         # 回答語言邏輯：永遠跟著 UI 語言選項走。
-        if ui_lang != "繁體中文":
-            lang_name = LANGUAGES.get(ui_lang, "Traditional Chinese")
-            lang_rule = (
-                f"\n6. 除「### 法條依據」中的法條原文須保留繁體中文（避免翻譯造成法律歧義）外，"
-                f"其餘所有文字請使用「{lang_name}」撰寫；"
-                f"法條原文後方請附上一句{lang_name}白話翻譯。"
-                f"加班費倍率的數字（如 4/3、5/3、1.33、1.66）必須維持原本數值與格式，不可換算。"
-            )
-        else:
-            lang_rule = ""
+        lang_rule = build_lang_rule(ui_lang, LANGUAGES.get(ui_lang, "Traditional Chinese"))
 
         # Missing-fields disclaimer — only appended when fields were still absent
         # after the follow-up dialog, so Gemini won't invent numbers.
-        if missing_fields:
-            labels = "、".join(
-                MISSING_FIELDS_LABELS.get(f, f) for f in missing_fields
-            )
-            missing_note = (
-                f"\n\n【重要提示：本問題因缺少以下資訊，僅能提供一般情況說明，"
-                f"請勿自行假設任何數值，如需精確計算請補充後重新詢問。】\n"
-                f"缺少的資訊：{labels}"
-            )
-        else:
-            missing_note = ""
+        labels = "、".join(MISSING_FIELDS_LABELS.get(f, f) for f in (missing_fields or []))
+        missing_note = build_missing_note(labels)
 
-        final_prompt = f"""
-【相關法規條文】（資料庫檢索）：
-{law_ctx}
-
-使用者問題：{user_prompt}
-
-【回答格式要求】：
-1. 只輸出以下兩個部分，不要加其他區塊：
-
-   ### 結論與做法
-   先用一到兩句話直接回答，再列出具體步驟或試算。
-   - 語氣用「依法規定」或「依你提供的資料估算」，不要寫成最終判定。
-   - 加班費情境：提到雇主可能提供「補休」選項；說明「加給三分之一，合計為平日 4/3 倍（約 1.33 倍）」；
-     第 32 條只說與本問題相關的工時上限，不需展開全文。
-   - 若資料不足，明說不足之處，不要猜測數字。
-
-   ### 法條依據
-   逐條列出條號與重點。只能引用上方提供的條文，不得憑記憶補充其他條文。
-   若資料庫中沒有相關條文，直接寫「資料庫中沒有相關條文」。
-
-2. 加班費倍率必須同時列出精確分數與約略小數（例如「4/3 倍（約 1.33 倍）」），
-   不可只寫約略小數，也不可寫成「多 33%」；倍率以平日每小時工資額為計算基準。
-
-3. 若問題涉及依年資對應的法條級距（特別休假、資遣預告期間、資遣費等），
-   先判斷使用者年資落在哪一款，全文只用該款數字；「結論」與「法條依據」引用的級距必須一致。
-
-4. 若問題完全超出勞動基準法與施行細則範圍（例如性別平等工作法、公司法等），
-   在最前面單獨輸出「[OOS]」（四個字元加括號），其餘照常簡短回答。
-
-5. 若資料庫中沒有相關條文，須明確說明，不可捏造條號。{lang_rule}{missing_note}
-"""
+        final_prompt = build_user_prompt(law_ctx, user_prompt, lang_rule, missing_note)
         _t_prompt = time.perf_counter()
 
         # Disable thinking (budget=0) to reduce latency on Flash
         _thinking_kwargs: dict = {}
         if hasattr(types, "ThinkingConfig"):
             _thinking_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=final_prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                **_thinking_kwargs,
-            ),
-        )
+
+    except Exception as e:
+        return f"🚨 異常：{str(e)}"
+
+    _stats = {"t_first": None, "usage": None, "retries": 0}
+
+    def _raw() -> Iterator[str]:
+        """Yield raw Gemini text chunks, recording first-token time and usage.
+
+        Retries a failed/timed-out request only if no text was yielded yet;
+        once the user has seen part of the answer, the error is re-raised.
+        """
+        for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+            emitted = False
+            try:
+                for chunk in client.models.generate_content_stream(
+                    model="gemini-2.5-flash",
+                    contents=final_prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_prompt,
+                        **_thinking_kwargs,
+                    ),
+                ):
+                    if getattr(chunk, "usage_metadata", None):
+                        _stats["usage"] = chunk.usage_metadata
+                    if chunk.text:
+                        if _stats["t_first"] is None:
+                            _stats["t_first"] = time.perf_counter()
+                        emitted = True
+                        yield chunk.text
+                return
+            except Exception as e:
+                if emitted or attempt == GEMINI_MAX_ATTEMPTS:
+                    raise
+                _stats["retries"] += 1
+                print(f"[GEMINI] 第 {attempt} 次呼叫失敗，重試：{e}", flush=True)
+
+    def _stream() -> Iterator[str]:
+        """Stream the <answer> body; OUT scope gets the fixed referral text instead."""
+        is_out = False
+        try:
+            for piece in stream_reply(_raw()):
+                # stream_reply yields the OUT_OF_SCOPE_TEXT object itself for OUT scope
+                is_out = is_out or piece is OUT_OF_SCOPE_TEXT
+                yield piece
+        except Exception as e:
+            _rag_logger.info(
+                f"q={user_prompt[:25]!r} ERROR after {time.perf_counter()-_t_prompt:.3f}s "
+                f"retries={_stats['retries']} shown={_stats['t_first'] is not None} err={e!r}"
+            )
+            yield f"\n\n🚨 回答中斷（{type(e).__name__}），請再問一次。"
+            return
+
         _t_gemini = time.perf_counter()
+        _t_first  = _stats["t_first"]
+        _usage    = _stats["usage"]
 
         # Token usage
-        _usage         = getattr(response, "usage_metadata", None)
         _thinking_tok  = int(getattr(_usage, "thoughts_token_count",    0) or 0)
         _output_tok    = int(getattr(_usage, "candidates_token_count",  0) or 0)
 
@@ -918,24 +1018,19 @@ def query_rag_system(
             f"case_search={_t_case_search-_t_force_l:.3f}s "
             f"force_c={_t_force_c-_t_case_search:.3f}s "
             f"prompt={_t_prompt-_t_force_c:.3f}s "
+            f"ttft={(_t_first or _t_gemini)-_t_prompt:.3f}s "
             f"gemini={_t_gemini-_t_prompt:.3f}s "
             f"total={_t_gemini-_t0:.3f}s "
             f"prompt_chars={len(final_prompt)} "
-            f"thinking_tok={_thinking_tok} output_tok={_output_tok}"
+            f"thinking_tok={_thinking_tok} output_tok={_output_tok} "
+            f"scope={'OUT' if is_out else 'IN'} retries={_stats['retries']}"
         )
 
-        answer = response.text or ""
+        # OUT_OF_SCOPE_TEXT already lists referral channels
+        if not is_out:
+            yield REFERRAL_BLOCK
 
-        # Detect out-of-scope marker and format accordingly
-        oos_prefix = ""
-        if answer.lstrip().startswith("[OOS]"):
-            answer    = answer.lstrip().removeprefix("[OOS]").lstrip()
-            oos_prefix = OUT_OF_SCOPE_NOTE
-
-        return oos_prefix + answer + REFERRAL_BLOCK
-
-    except Exception as e:
-        return f"🚨 異常：{str(e)}"
+    return _stream()
 
 
 # ==========================================
@@ -945,15 +1040,25 @@ def show_login_page():
     render_language_switcher()
     lang = st.session_state.ui_lang
 
-    st.markdown("<br>", unsafe_allow_html=True)
-    _, mid, _ = st.columns([1, 2, 1])
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    _, mid, _ = st.columns([1, 1.6, 1])
     with mid:
         st.markdown(
-            "<div style='text-align:center; margin-bottom:0.5rem;'>"
-            "<span style='font-size:3rem;'>⚖️</span>"
+            "<div style='"
+            "background:#faf8f4;"
+            "border:1px solid #e6dece;"
+            "border-radius:16px;"
+            "padding:2.4rem 2.2rem 2rem;"
+            "box-shadow:0 4px 24px rgba(15,35,24,0.09);"
+            "'>"
+            "<div style='text-align:center; margin-bottom:0.8rem;'>"
+            "<span style='font-size:2.6rem; line-height:1;'>⚖️</span>"
             "</div>"
-            f"<h2 style='text-align:center; color:#1a2744; font-size:1.45rem; margin-bottom:0.2rem;'>{t(lang, 'app_title').replace('⚖️ ','')}</h2>"
-            f"<p style='text-align:center; color:#64748b; margin-bottom:1.5rem; font-size:0.95rem;'>{t(lang, 'login_subheader')}</p>",
+            f"<h2 style='text-align:center; color:#1a3a28; font-size:1.4rem;"
+            f" font-weight:700; margin-bottom:0.25rem; letter-spacing:-0.2px;'>"
+            f"{t(lang, 'app_title').replace('⚖️ ', '')}</h2>"
+            f"<p style='text-align:center; color:#7a6e58; margin-bottom:1.6rem;"
+            f" font-size:0.9rem;'>{t(lang, 'login_subheader')}</p>",
             unsafe_allow_html=True,
         )
 
@@ -996,6 +1101,8 @@ def show_login_page():
                         else:
                             st.error(localized_msg)
 
+        st.markdown("</div>", unsafe_allow_html=True)
+
 
 # ==========================================
 # 5. 頁面二：身份選擇 (Landing Page)
@@ -1004,25 +1111,39 @@ def show_landing_page():
     render_language_switcher()
     lang = st.session_state.ui_lang
 
+    # ── Hero ──────────────────────────────────────────────────────────────────
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown(
-        "<h1 style='text-align:center; color:#1a2744;'>⚖️ " + t(lang, "app_title").replace("⚖️ ", "") + "</h1>"
-        f"<p style='text-align:center; color:#4a5568; font-size:1.05rem; margin-bottom:0.3rem;'>{t(lang, 'landing_subheader')}</p>"
-        f"<p style='text-align:center; color:#64748b; font-size:0.9rem; margin-bottom:2rem;'>{t(lang, 'landing_desc')}</p>",
+        "<div style='text-align:center; padding:0.5rem 0 1.8rem;'>"
+        "<div style='display:inline-block; background:#1a3a28; border-radius:50%;"
+        " width:64px; height:64px; line-height:64px; font-size:2rem; margin-bottom:1rem;'>⚖️</div>"
+        "<h1 style='color:#1a3a28; font-size:1.9rem; font-weight:700; margin-bottom:0.35rem;'>"
+        + t(lang, "app_title").replace("⚖️ ", "") +
+        "</h1>"
+        f"<p style='color:#2d6a3f; font-size:1.05rem; font-weight:500; margin-bottom:0.3rem;'>"
+        f"{t(lang, 'landing_subheader')}</p>"
+        f"<p style='color:#7a6e58; font-size:0.9rem;'>{t(lang, 'landing_desc')}</p>"
+        "</div>",
         unsafe_allow_html=True,
     )
 
-    _, c1, _, c2, _ = st.columns([0.5, 3, 0.3, 3, 0.5])
+    # ── 角色卡 ────────────────────────────────────────────────────────────────
+    _, c1, _, c2, _ = st.columns([0.8, 3, 0.4, 3, 0.8])
 
     with c1:
         st.markdown(
             "<div class='role-card'>"
-            "<h3>🙋‍♂️ " + t(lang, "role_label_employee") + "</h3>"
-            f"<p>{t(lang, 'role_employee_desc')}</p>"
+            "<div style='font-size:2rem; margin-bottom:0.7rem;'>🙋</div>"
+            "<h3 style='color:#1a3a28; font-size:1.15rem; margin-bottom:0.5rem;'>"
+            + t(lang, "role_label_employee") +
+            "</h3>"
+            f"<p style='color:#7a6e58; font-size:0.9rem; line-height:1.65; margin-bottom:1.2rem;'>"
+            f"{t(lang, 'role_employee_desc')}</p>"
+            "<div style='height:3px; background:linear-gradient(90deg,#2d6a3f,#c9a84c);"
+            " border-radius:2px; margin-bottom:0.8rem;'></div>"
             "</div>",
             unsafe_allow_html=True,
         )
-        st.markdown("<div style='margin-top:0.6rem;'></div>", unsafe_allow_html=True)
         if st.button(t(lang, "role_employee_btn"), use_container_width=True, key="emp_btn"):
             st.session_state.user_role        = "Employee"
             st.session_state.page             = "Chat"
@@ -1033,12 +1154,17 @@ def show_landing_page():
     with c2:
         st.markdown(
             "<div class='role-card'>"
-            "<h3>🏢 " + t(lang, "role_label_employer") + "</h3>"
-            f"<p>{t(lang, 'role_employer_desc')}</p>"
+            "<div style='font-size:2rem; margin-bottom:0.7rem;'>🏢</div>"
+            "<h3 style='color:#1a3a28; font-size:1.15rem; margin-bottom:0.5rem;'>"
+            + t(lang, "role_label_employer") +
+            "</h3>"
+            f"<p style='color:#7a6e58; font-size:0.9rem; line-height:1.65; margin-bottom:1.2rem;'>"
+            f"{t(lang, 'role_employer_desc')}</p>"
+            "<div style='height:3px; background:linear-gradient(90deg,#2d6a3f,#c9a84c);"
+            " border-radius:2px; margin-bottom:0.8rem;'></div>"
             "</div>",
             unsafe_allow_html=True,
         )
-        st.markdown("<div style='margin-top:0.6rem;'></div>", unsafe_allow_html=True)
         if st.button(t(lang, "role_employer_btn"), use_container_width=True, key="er_btn"):
             st.session_state.user_role        = "Employer"
             st.session_state.page             = "Chat"
@@ -1046,8 +1172,12 @@ def show_landing_page():
             st.session_state.current_chat_id  = None
             st.rerun()
 
-    st.markdown("<br><br>", unsafe_allow_html=True)
-    st.caption(t(lang, "landing_caption").format(username=st.session_state.username))
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown(
+        f"<p style='text-align:center; color:#7a6e58; font-size:0.85rem;'>"
+        f"{t(lang, 'landing_caption').format(username=st.session_state.username)}</p>",
+        unsafe_allow_html=True,
+    )
 
 
 def _render_case_results(c_results: list, lang: str) -> None:
@@ -1080,14 +1210,9 @@ def show_chat_room():
     render_language_switcher()
     lang = st.session_state.ui_lang
 
+    persona = build_system_prompt(st.session_state.user_role)
     if st.session_state.user_role == "Employee":
         title   = t(lang, "chat_title_employee")
-        persona = (
-            "你是一位專業勞工法律顧問，專門協助勞工了解並保護自身的勞動權益。"
-            "你具備深厚的台灣勞動法律知識，包括勞動基準法及其施行細則。"
-            "請以友善、清晰、易懂的語氣回答問題。"
-            "只引用資料庫提供的條文；資料庫中沒有的條文，不得憑記憶補充。"
-        )
         btns = [
             (t(lang, "qe_btn1"), "我被資遣了！我的權益是什麼？"),
             (t(lang, "qe_btn2"), "加班費怎麼算？"),
@@ -1096,12 +1221,6 @@ def show_chat_room():
         ]
     else:
         title   = t(lang, "chat_title_employer")
-        persona = (
-            "你是一位專業企業勞動法律顧問，專門協助雇主和HR在合法合規的前提下管理勞資關係。"
-            "你具備深厚的台灣勞動法律知識，並能從企業管理角度提供實用建議。"
-            "請以專業、嚴謹的語氣回答。"
-            "只引用資料庫提供的條文；資料庫中沒有的條文，不得憑記憶補充。"
-        )
         btns = [
             (t(lang, "qr_btn1"), "合法資遣流程？"),
             (t(lang, "qr_btn2"), "員工連續曠職怎麼辦？"),
@@ -1113,9 +1232,25 @@ def show_chat_room():
 
     # --- 側邊欄 ---
     with st.sidebar:
-        st.title(t(lang, "sidebar_title"))
-        st.write(t(lang, "sidebar_account").format(username=st.session_state.username))
-        st.write(t(lang, "sidebar_role").format(role=role_label))
+        # Brand header
+        st.markdown(
+            "<div style='padding:0.6rem 0 0.2rem; text-align:center;'>"
+            "<span style='font-size:1.6rem;'>⚖️</span>"
+            f"<p style='color:#d4e8da; font-size:0.78rem; margin:0.3rem 0 0;"
+            f" letter-spacing:0.5px; opacity:0.75;'>{t(lang, 'sidebar_title')}</p>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        st.divider()
+
+        # Account info
+        st.markdown(
+            f"<p style='color:#a8c8b0; font-size:0.8rem; margin-bottom:0.15rem;'>"
+            f"👤 {st.session_state.username}</p>"
+            f"<p style='color:#c9a84c; font-size:0.78rem; margin-bottom:0.8rem;"
+            f" font-weight:500;'>[ {role_label} ]</p>",
+            unsafe_allow_html=True,
+        )
 
         if st.button(t(lang, "btn_new_chat"), use_container_width=True):
             st.session_state.messages        = []
@@ -1141,22 +1276,27 @@ def show_chat_room():
             st.rerun()
 
         st.divider()
-        st.markdown(f"### {t(lang, 'quick_questions_title')}")
+
+        # Quick questions
+        st.markdown(
+            f"<p style='color:#a8c8b0; font-size:0.78rem; font-weight:600;"
+            f" letter-spacing:0.4px; text-transform:uppercase; margin-bottom:0.5rem;'>"
+            f"{t(lang, 'quick_questions_title')}</p>",
+            unsafe_allow_html=True,
+        )
         for label, value in btns:
             if st.button(label, use_container_width=True):
                 st.session_state.btn_input = value
 
         st.divider()
-        # Memory monitor — remove after testing
-        try:
-            import psutil as _psutil
-            st.sidebar.caption(
-                f"RSS: {_psutil.Process().memory_info().rss / 1024**2:.0f} MB"
-            )
-        except ImportError:
-            pass
 
-        st.markdown(f"### {t(lang, 'history_title')}")
+        # Chat history
+        st.markdown(
+            f"<p style='color:#a8c8b0; font-size:0.78rem; font-weight:600;"
+            f" letter-spacing:0.4px; text-transform:uppercase; margin-bottom:0.5rem;'>"
+            f"{t(lang, 'history_title')}</p>",
+            unsafe_allow_html=True,
+        )
         saved_chats = list_chats(st.session_state.username)
         if not saved_chats:
             st.info(t(lang, "history_empty"))
@@ -1173,7 +1313,14 @@ def show_chat_room():
                     st.rerun()
 
     # --- 主聊天區 ---
-    st.title(f"⚖️ {title}")
+    st.markdown(
+        f"<div style='border-bottom:2px solid #e6dece; padding-bottom:0.6rem; margin-bottom:0.5rem;'>"
+        f"<h2 style='color:#1a3a28; font-size:1.35rem; font-weight:700; margin:0;'>"
+        f"⚖️ {title}</h2>"
+        f"<span style='color:#7a6e58; font-size:0.85rem;'>勞動基準法 AI 顧問 · 勞動部法規資料庫</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
@@ -1208,9 +1355,13 @@ def show_chat_room():
         st.session_state.messages.append({"role": "user", "content": prompt})
 
         with st.chat_message("assistant"):
+            # Spinner covers retrieval only; the answer then streams in
             with st.spinner(t(lang, "thinking_spinner")):
                 resp = _handle_prompt(prompt, persona, lang)
+            if isinstance(resp, str):
                 st.markdown(resp)
+            else:
+                resp = st.write_stream(resp)
         st.session_state.messages.append({"role": "assistant", "content": resp})
 
         if not st.session_state.current_chat_id:

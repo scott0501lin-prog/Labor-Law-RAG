@@ -6,9 +6,9 @@ without touching app.py.
 import os
 
 # ── Feature toggle ────────────────────────────────────────────────────────────
-# Set INTENT_DETECTION=false in .env or Streamlit Secrets to revert to the
-# original single-call RAG flow.
-ENABLE_INTENT_DETECTION = os.getenv("INTENT_DETECTION", "true").lower() == "true"
+# Disabled by default to save one Gemini round-trip per question.
+# Set INTENT_DETECTION=true in .env or Streamlit Secrets to re-enable.
+ENABLE_INTENT_DETECTION = os.getenv("INTENT_DETECTION", "false").lower() == "true"
 
 # ── Follow-up limits ──────────────────────────────────────────────────────────
 MAX_FOLLOWUP_ROUNDS = 2

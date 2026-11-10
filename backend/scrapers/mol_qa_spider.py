@@ -9,6 +9,8 @@
 """
 
 import re, json, time, random, logging, urllib3
+import os
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")  # backend/data
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
@@ -321,7 +323,7 @@ def crawl_qa(pw_page, fps, targets):
 
 def main():
     from playwright.sync_api import sync_playwright
-    fps = load_fps("labor_law_cleaned.json")
+    fps = load_fps(os.path.join(DATA_DIR, "labor_law_cleaned.json"))
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -346,7 +348,7 @@ def main():
         results = crawl_qa(page, fps, QA_TARGETS)
         browser.close()
 
-    output = "mol_qa_cases.json"
+    output = os.path.join(DATA_DIR, "mol_qa_cases.json")
     with open(output, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     logger.info(f"\n✅ 完成！共 {len(results)} 筆 → {output}")

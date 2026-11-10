@@ -1,15 +1,15 @@
 """
 比較舊索引（embeddings_v1_backup）與新索引（embeddings）的檢索結果。
 用法：
-  python backend/compare_index.py              # 跑全部 20 題測試題庫
-  python backend/compare_index.py "加班費怎麼算"  # 單題
+  python eval/compare_index.py              # 跑全部 20 題測試題庫
+  python eval/compare_index.py "加班費怎麼算"  # 單題
 """
 
 import os, sys, json
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend")
 MODEL_NAME = "shibing624/text2vec-base-chinese"
 TOP_K = 5
 TOP_K_CHUNKS = 20   # 合併前候選 chunk 數

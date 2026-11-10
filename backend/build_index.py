@@ -16,6 +16,7 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
 OUT_DIR  = os.path.join(BASE_DIR, "embeddings")
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -40,7 +41,7 @@ CASE_FILES = [
 # ==========================================
 
 def load_json(filename):
-    with open(os.path.join(BASE_DIR, filename), encoding="utf-8") as f:
+    with open(os.path.join(DATA_DIR, filename), encoding="utf-8") as f:
         return json.load(f)
 
 

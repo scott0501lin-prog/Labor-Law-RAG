@@ -5,11 +5,13 @@
 判決列表在 iframe 裡，page.content() 取不到。
 改為用 page.frames 找到正確的 frame，從 frame.content() 解析。
 
-執行：python judicial_spider.py（會開啟瀏覽器視窗）
+執行：python backend/scrapers/judicial_spider.py（會開啟瀏覽器視窗）
 輸出：judicial_cases.json
 """
 
 import re, json, time, random, logging
+import os
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")  # backend/data
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
@@ -357,7 +359,7 @@ def crawl_judicial(page, fps):
 
 def main():
     from playwright.sync_api import sync_playwright
-    fps = load_fps("labor_law_cleaned.json")
+    fps = load_fps(os.path.join(DATA_DIR, "labor_law_cleaned.json"))
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -377,7 +379,7 @@ def main():
         results = crawl_judicial(pw_page, fps)
         browser.close()
 
-    output = "judicial_cases.json"
+    output = os.path.join(DATA_DIR, "judicial_cases.json")
     with open(output, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     logger.info(f"\n✅ 完成！共 {len(results)} 筆 → {output}")

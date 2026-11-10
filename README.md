@@ -74,13 +74,15 @@ streamlit run Fronted/app.py
 ├── Fronted/
 │   ├── app.py          # 主應用程式（Streamlit UI + RAG 引擎）
 │   ├── db.py           # MongoDB 資料層（帳號、對話紀錄）
-│   └── i18n.py         # 多語系介面文字
+│   ├── i18n.py         # 多語系介面文字
+│   ├── force_rules.py  # 關鍵字強制帶入條文規則
+│   └── intent_config.py # 意圖判斷與追問設定
 ├── backend/
 │   ├── build_index.py  # 預計算 embedding 並儲存為 .npy
 │   ├── embeddings/     # 預計算的向量索引（.npy + .json）
-│   ├── labor_law_cleaned.json
-│   ├── labor_law_rules_cleaned.json
-│   └── *_cases.json    # 各類案例資料
+│   ├── data/           # 法條與案例原始資料（*.json）
+│   └── scrapers/       # 爬蟲腳本（輸出至 backend/data/）
+├── eval/               # 測試與評估腳本（檢索比較、計時、強制帶入規則測試）
 ├── requirements.txt
 └── .env                # 機密設定（不上傳 GitHub）
 ```

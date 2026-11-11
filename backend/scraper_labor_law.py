@@ -3,7 +3,6 @@
 資料來源：全國法規資料庫 (law.moj.gov.tw)
 輸出：
   - backend/labor_law.json   （原始條文 JSON）
-  - backend/law_db/           （ChromaDB，供 RAG 使用）
 """
 
 import json

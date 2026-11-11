@@ -459,81 +459,109 @@ def _build_chroma_collections(client, emb_dir, law_texts, law_metas, case_texts,
     _populate("cases", _CASES_COL_NAME, case_texts, case_metas)
 
 
-@st.cache_resource(show_spinner="正在準備索引…")
+@st.cache_resource(show_spinner="正在準備索引，首次約需 2-3 分鐘…")
 def _load_chroma_index():
-    """Load or build ChromaDB collections.
+    """Load or build ChromaDB using local bge-m3 embeddings from JSON data files.
 
-    Returns the 7-tuple on success, or None when both load and rebuild fail —
-    callers must fall back to the NumPy path in that case.
+    Returns (model, law_col, cases_col, law_texts, law_metas,
+             case_texts, case_metas) on success, or None to signal fallback.
     """
-    import chromadb, json, shutil
+    import chromadb, json
     from sentence_transformers import SentenceTransformer
 
-    emb_dir = os.path.join(base_dir, "backend", "embeddings")
+    _BGE_LAW_COL   = "law_chunks_bgem3"
+    _BGE_CASES_COL = "cases_chunks_bgem3"
 
-    def _load_json(prefix):
-        with open(os.path.join(emb_dir, f"{prefix}_docs{_MODEL_SUFFIX}.json"), encoding="utf-8") as f:
-            d = json.load(f)
-        return d["texts"], d["metas"]
+    def _smart_split(text, max_chars, overlap):
+        if len(text) <= max_chars:
+            return [text]
+        chunks, start = [], 0
+        while start < len(text):
+            end = min(start + max_chars, len(text))
+            if end < len(text):
+                for b in ["。", "；", "！", "？", "\n"]:
+                    pos = text.rfind(b, start + max_chars // 3, end)
+                    if pos != -1:
+                        end = pos + 1
+                        break
+            chunks.append(text[start:end])
+            if end >= len(text):
+                break
+            start = max(start + 1, end - overlap)
+        return chunks
 
-    law_texts,  law_metas  = _load_json("law")
-    case_texts, case_metas = _load_json("cases")
+    def _load_data():
+        data_dir = os.path.join(base_dir, "backend", "data")
+        def _jload(fn):
+            path = os.path.join(data_dir, fn)
+            return json.load(open(path, encoding="utf-8")) if os.path.exists(path) else []
 
-    def _try_load(rebuild: bool):
-        if rebuild:
-            print(f"[CHROMA] 索引損壞，刪除重建：{_CHROMA_DB_PATH}", flush=True)
-            shutil.rmtree(_CHROMA_DB_PATH, ignore_errors=True)
-            os.makedirs(_CHROMA_DB_PATH, exist_ok=True)
+        law_texts, law_metas = [], []
+        for fn in ["labor_law_cleaned.json", "labor_law_rules_cleaned.json", "gender_equality_law.json"]:
+            for item in _jload(fn):
+                art_no    = item.get("article_no", "")
+                parent_id = f"law_{art_no}"
+                for idx, chunk in enumerate(_smart_split(item.get("text", ""), 500, 50)[:50]):
+                    law_texts.append(chunk)
+                    law_metas.append({"data_type": "law", "source": item.get("source", ""),
+                                      "article_no": art_no, "parent_id": parent_id,
+                                      "chunk_idx": idx, "category": "", "title": "", "url": ""})
 
-        client   = chromadb.PersistentClient(path=_CHROMA_DB_PATH)
-        existing = {c.name for c in client.list_collections()}
+        case_texts, case_metas = [], []
+        for fn in ["taipei_cases.json", "mol_qa_cases.json", "mol_fint_cases.json",
+                   "judicial_cases.json", "ntpc_cases.json", "derived_interpretations.json"]:
+            for doc_idx, item in enumerate(_jload(fn)):
+                content = item.get("content", "").strip()
+                if not content:
+                    continue
+                source    = item.get("source", "")
+                category  = item.get("category", "")
+                label     = f"【{source} {category}】"
+                parent_id = f"{fn.replace('.json', '')}_{doc_idx}"
+                for idx, chunk in enumerate(_smart_split(content, 400, 50)[:50]):
+                    case_texts.append(f"{label}\n{chunk}")
+                    case_metas.append({"data_type": "case", "source": source, "category": category,
+                                       "title": item.get("title", "").strip(), "url": item.get("url", ""),
+                                       "parent_id": parent_id, "chunk_idx": idx, "article_no": ""})
+        return law_texts, law_metas, case_texts, case_metas
 
-        need_build = _LAW_COL_NAME not in existing or _CASES_COL_NAME not in existing
-        if not need_build:
-            law_tmp   = client.get_collection(_LAW_COL_NAME)
-            cases_tmp = client.get_collection(_CASES_COL_NAME)
-            if law_tmp.count() != len(law_texts) or cases_tmp.count() != len(case_texts):
-                need_build = True
-
-        if need_build:
-            _build_chroma_collections(client, emb_dir, law_texts, law_metas, case_texts, case_metas)
-
-        law_col   = client.get_collection(_LAW_COL_NAME)
-        cases_col = client.get_collection(_CASES_COL_NAME)
-        return law_col, cases_col
-
-    # First attempt (no rebuild)
-    try:
-        law_col, cases_col = _try_load(rebuild=False)
-        print(f"[CHROMA] 索引就緒：law={law_col.count()}, cases={cases_col.count()}", flush=True)
-    except Exception as e:
-        print(f"[CHROMA] 載入失敗：{e}", flush=True)
-        print("[CHROMA] 嘗試刪除重建…", flush=True)
-        # Second attempt: wipe and rebuild from .npy / .json
+    def _populate(client, name, texts, metas, model):
         try:
-            law_col, cases_col = _try_load(rebuild=True)
-            print(f"[CHROMA] 重建成功：law={law_col.count()}, cases={cases_col.count()}", flush=True)
-        except Exception as e2:
-            print(f"[CHROMA] 重建仍失敗，退回 NumPy 路徑：{e2}", flush=True)
-            return None  # caller detects None and uses numpy
+            client.delete_collection(name)
+        except Exception:
+            pass
+        col  = client.create_collection(name, metadata={"hnsw:space": "cosine"})
+        embs = model.encode(texts, batch_size=32, normalize_embeddings=True, show_progress_bar=False)
+        ids  = [f"{name}_{i}" for i in range(len(texts))]
+        for s in range(0, len(ids), 256):
+            col.add(ids=ids[s:s+256], embeddings=embs[s:s+256].tolist(),
+                    documents=texts[s:s+256], metadatas=metas[s:s+256])
+        return col
 
-    import time as _time
-    t0 = _time.perf_counter()
-    model = SentenceTransformer(_MODEL_NAME)
-    load_time = _time.perf_counter() - t0
-    t_enc = _time.perf_counter()
-    sample = model.encode(["test"], normalize_embeddings=True)
-    enc_ms = (_time.perf_counter() - t_enc) * 1000
-    dim = sample.shape[1]
     try:
-        import psutil as _ps
-        rss = _ps.Process().memory_info().rss / 1024 ** 2
-        print(f"[MODEL] {_MODEL_NAME} | dim={dim} | load={load_time:.1f}s | RSS={rss:.0f}MB | encode={enc_ms:.0f}ms", flush=True)
-    except ImportError:
-        print(f"[MODEL] {_MODEL_NAME} | dim={dim} | load={load_time:.1f}s | encode={enc_ms:.0f}ms", flush=True)
-    print(f"[INDEX] law={law_col.count()} cases={cases_col.count()} total={law_col.count()+cases_col.count()}", flush=True)
+        law_texts, law_metas, case_texts, case_metas = _load_data()
 
-    return model, law_col, cases_col, law_texts, law_metas, case_texts, case_metas
+        chroma_client = chromadb.PersistentClient(path=_CHROMA_DB_PATH)
+        existing = {c.name for c in chroma_client.list_collections()}
+
+        if _BGE_LAW_COL in existing and _BGE_CASES_COL in existing:
+            law_col   = chroma_client.get_collection(_BGE_LAW_COL)
+            cases_col = chroma_client.get_collection(_BGE_CASES_COL)
+            if law_col.count() == len(law_texts) and cases_col.count() == len(case_texts):
+                model = SentenceTransformer("BAAI/bge-m3")
+                print(f"[CHROMA] bge-m3 索引就緒：law={law_col.count()}, cases={cases_col.count()}", flush=True)
+                return model, law_col, cases_col, law_texts, law_metas, case_texts, case_metas
+
+        print(f"[CHROMA] 建立 bge-m3 索引（首次或資料更新後）…", flush=True)
+        model     = SentenceTransformer("BAAI/bge-m3")
+        law_col   = _populate(chroma_client, _BGE_LAW_COL,   law_texts,  law_metas,  model)
+        cases_col = _populate(chroma_client, _BGE_CASES_COL, case_texts, case_metas, model)
+        print(f"[CHROMA] 完成：law={law_col.count()}, cases={cases_col.count()}", flush=True)
+        return model, law_col, cases_col, law_texts, law_metas, case_texts, case_metas
+
+    except Exception as e:
+        print(f"[CHROMA] bge-m3 索引失敗：{e}", flush=True)
+        return None
 
 
 def _search(model, query, embeddings, texts, metas, top_k=5, _top_k_chunks=20):
@@ -555,7 +583,7 @@ def _search(model, query, embeddings, texts, metas, top_k=5, _top_k_chunks=20):
 
 def _chroma_search(model, collection, query, top_k=5, _top_k_chunks=20):
     """ChromaDB equivalent of _search(); returns [(text, meta, score)] in the same format."""
-    q_emb = model.encode([query], normalize_embeddings=True)  # (1, 768), L2-normalized
+    q_emb = model.encode([query], normalize_embeddings=True)
     results = collection.query(
         query_embeddings=[q_emb[0].tolist()],
         n_results=_top_k_chunks,

@@ -1,3 +1,14 @@
+---
+title: 勞資爭議智慧法務 AI 顧問
+emoji: ⚖️
+colorFrom: blue
+colorTo: indigo
+sdk: streamlit
+sdk_version: 1.45.0
+app_file: Fronted/app.py
+pinned: false
+---
+
 # ⚖️ 勞資爭議智慧法務 AI 顧問系統
 
 一套以 RAG（檢索增強生成）為核心的台灣勞動法律諮詢平台，協助勞方與資方快速查詢勞動基準法相關規定、案例與權益說明。

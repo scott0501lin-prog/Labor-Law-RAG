@@ -1,36 +1,40 @@
 """
-直接從 backend/data/ 計算 bge-m3 向量並存入 ChromaDB。
+使用 Voyage AI API 建立向量索引並存入 ChromaDB。
 執行一次即可：python backend/build_chroma.py
 
-Collections（與 app.py 一致）：
-  law_chunks_bgem3   — 勞基法本法 + 施行細則 + 性別平等工作法（一條一塊）
-  cases_chunks_bgem3 — 案例 / Q&A / 裁判書（約 400 字一塊）
+需先設定環境變數 VOYAGE_API_KEY（或在 .env 中設定）。
 
-metadata 欄位可用於 ChromaDB where 過濾：
-  law   : source, article_no, parent_id, chunk_idx, data_type="law"
-  cases : source, category, title, url, parent_id, chunk_idx, data_type="case"
+Collections：
+  law_chunks_voyage   — 勞基法本法 + 施行細則 + 性別平等工作法
+  cases_chunks_voyage — 案例 / Q&A / 裁判書
 """
 
 import json
 import os
 import time
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-CHROMA_DIR = os.getenv("CHROMA_DB_PATH", os.path.join(BASE_DIR, "chroma_db"))
-# Same rule as app.py: Chroma's HNSW writer fails on non-ASCII paths on Windows
-if not CHROMA_DIR.isascii():
-    CHROMA_DIR = os.path.join(os.getenv("LOCALAPPDATA") or os.path.expanduser("~"), "law_rag", "chroma_db")
+from dotenv import load_dotenv
 
-MODEL_NAME = "BAAI/bge-m3"
-COLLECTION_LAW   = "law_chunks_bgem3"
-COLLECTION_CASES = "cases_chunks_bgem3"
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR    = os.path.join(BASE_DIR, "data")
+CHROMA_DIR  = os.getenv("CHROMA_DB_PATH", os.path.join(BASE_DIR, "chroma_db"))
+if not CHROMA_DIR.isascii():
+    CHROMA_DIR = os.path.join(
+        os.getenv("LOCALAPPDATA") or os.path.expanduser("~"), "law_rag", "chroma_db"
+    )
+
+VOYAGE_MODEL     = "voyage-multilingual-2"
+COLLECTION_LAW   = "law_chunks_voyage"
+COLLECTION_CASES = "cases_chunks_voyage"
 
 LAW_MAX_CHARS      = 500
 CASE_MAX_CHARS     = 400
 CASE_OVERLAP       = 50
 MAX_CHUNKS_PER_DOC = 50
-BATCH_SIZE         = 256
+EMBED_BATCH        = 128
+CHROMA_BATCH       = 256
 
 CASE_FILES = [
     "taipei_cases.json",
@@ -42,10 +46,12 @@ CASE_FILES = [
 ]
 
 
-# ── 工具 ─────────────────────────────────────────────────────────────────────
-
 def load_json(filename):
-    with open(os.path.join(DATA_DIR, filename), encoding="utf-8") as f:
+    path = os.path.join(DATA_DIR, filename)
+    if not os.path.exists(path):
+        print(f"  ⚠️  {filename} 不存在，略過")
+        return []
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -68,18 +74,14 @@ def smart_split(text, max_chars, overlap):
     return chunks
 
 
-# ── 切塊 ─────────────────────────────────────────────────────────────────────
-
 def build_law_chunks(laws):
     texts, metas = [], []
     for item in laws:
         source     = item.get("source", "勞動基準法")
         article_no = item.get("article_no", "")
         full_text  = item.get("text", "")
-        label      = f"【{source} {article_no}】"
         parent_id  = f"law_{article_no}"
-        merged     = f"{label}\n{full_text}"
-        for idx, chunk in enumerate(smart_split(merged, LAW_MAX_CHARS, 50)[:MAX_CHUNKS_PER_DOC]):
+        for idx, chunk in enumerate(smart_split(full_text, LAW_MAX_CHARS, 50)[:MAX_CHUNKS_PER_DOC]):
             texts.append(chunk)
             metas.append({
                 "data_type" : "law",
@@ -97,31 +99,26 @@ def build_law_chunks(laws):
 def build_case_chunks(case_files):
     texts, metas = [], []
     for fn in case_files:
-        try:
-            items = load_json(fn)
-        except FileNotFoundError:
-            print(f"  ⚠️  {fn} 不存在，略過")
+        items = load_json(fn)
+        if not items:
             continue
         print(f"  {fn}：{len(items)} 筆")
         for doc_idx, item in enumerate(items):
-            source   = item.get("source", "")
-            category = item.get("category", "")
-            title    = item.get("title", "").strip()
-            url      = item.get("url", "")
             content  = item.get("content", "").strip()
             if not content:
                 continue
+            source    = item.get("source", "")
+            category  = item.get("category", "")
             label     = f"【{source} {category}】"
             parent_id = f"{fn.replace('.json', '')}_{doc_idx}"
             for idx, chunk in enumerate(smart_split(content, CASE_MAX_CHARS, CASE_OVERLAP)[:MAX_CHUNKS_PER_DOC]):
-                merged = f"{label}\n{chunk}"
-                texts.append(merged)
+                texts.append(f"{label}\n{chunk}")
                 metas.append({
                     "data_type" : "case",
                     "source"    : source,
                     "category"  : category,
-                    "title"     : title,
-                    "url"       : url,
+                    "title"     : item.get("title", "").strip(),
+                    "url"       : item.get("url", ""),
                     "parent_id" : parent_id,
                     "chunk_idx" : idx,
                     "article_no": "",
@@ -129,21 +126,33 @@ def build_case_chunks(case_files):
     return texts, metas
 
 
-# ── ChromaDB 寫入 ─────────────────────────────────────────────────────────────
+def embed_texts(voyage_client, texts, input_type="document"):
+    embs = []
+    for i in range(0, len(texts), EMBED_BATCH):
+        batch = texts[i:i + EMBED_BATCH]
+        res   = voyage_client.embed(batch, model=VOYAGE_MODEL, input_type=input_type)
+        embs.extend(res.embeddings)
+        done = min(i + EMBED_BATCH, len(texts))
+        print(f"  {done}/{len(texts)} 塊已編碼…", end="\r", flush=True)
+        if i + EMBED_BATCH < len(texts):
+            time.sleep(0.05)
+    print()
+    return embs
 
-def populate_collection(client, name, texts, metas, embeddings):
+
+def populate_collection(chroma_client, name, texts, metas, embeddings):
     try:
-        client.delete_collection(name)
+        chroma_client.delete_collection(name)
         print(f"  舊 collection '{name}' 已刪除")
     except Exception:
         pass
-    col = client.create_collection(name, metadata={"hnsw:space": "cosine"})
+    col = chroma_client.create_collection(name, metadata={"hnsw:space": "cosine"})
     ids = [f"{name}_{i}" for i in range(len(texts))]
-    for s in range(0, len(ids), BATCH_SIZE):
-        e = s + BATCH_SIZE
+    for s in range(0, len(ids), CHROMA_BATCH):
+        e = s + CHROMA_BATCH
         col.add(
             ids=ids[s:e],
-            embeddings=embeddings[s:e].tolist(),
+            embeddings=embeddings[s:e],
             documents=texts[s:e],
             metadatas=metas[s:e],
         )
@@ -151,54 +160,46 @@ def populate_collection(client, name, texts, metas, embeddings):
     return col
 
 
-# ── 主程式 ────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
-    import psutil
-    from sentence_transformers import SentenceTransformer
     import chromadb
+    import voyageai
 
-    proc = psutil.Process()
-    t_total = time.perf_counter()
+    voyage_key = os.getenv("VOYAGE_API_KEY")
+    if not voyage_key:
+        raise SystemExit("❌ VOYAGE_API_KEY 未設定。請在 .env 中加入 VOYAGE_API_KEY=...")
 
-    print(f"模型：{MODEL_NAME}")
-    rss0 = proc.memory_info().rss / 1024 ** 2
-    t0 = time.perf_counter()
-    model = SentenceTransformer(MODEL_NAME)
-    load_time = time.perf_counter() - t0
-    dim = model.encode(["test"], normalize_embeddings=True).shape[1]
-    rss1 = proc.memory_info().rss / 1024 ** 2
-    print(f"維度：{dim} | 載入：{load_time:.1f}s | 記憶體增加：{rss1 - rss0:.0f}MB\n")
+    t_total       = time.perf_counter()
+    voyage_client = voyageai.Client(api_key=voyage_key)
+    print(f"Voyage AI 模型：{VOYAGE_MODEL}\n")
 
-    # ── 法條 ──────────────────────────────────────────────────────────────────
     print("[1/2] 勞基法本法 + 施行細則 + 性別平等工作法")
-    laws = (load_json("labor_law_cleaned.json")
-            + load_json("labor_law_rules_cleaned.json")
-            + load_json("gender_equality_law.json"))
+    laws = (
+        load_json("labor_law_cleaned.json")
+        + load_json("labor_law_rules_cleaned.json")
+        + load_json("gender_equality_law.json")
+    )
     law_texts, law_metas = build_law_chunks(laws)
     print(f"  chunk 數：{len(law_texts)}")
     t1 = time.perf_counter()
-    law_emb = model.encode(law_texts, batch_size=32, show_progress_bar=True, normalize_embeddings=True)
+    law_embs = embed_texts(voyage_client, law_texts, input_type="document")
     print(f"  編碼：{time.perf_counter()-t1:.1f}s")
 
-    # ── 案例 ──────────────────────────────────────────────────────────────────
     print("\n[2/2] 案例 / Q&A / 裁判書")
     case_texts, case_metas = build_case_chunks(CASE_FILES)
     print(f"  chunk 數：{len(case_texts)}")
     t2 = time.perf_counter()
-    case_emb = model.encode(case_texts, batch_size=32, show_progress_bar=True, normalize_embeddings=True)
+    case_embs = embed_texts(voyage_client, case_texts, input_type="document")
     print(f"  編碼：{time.perf_counter()-t2:.1f}s")
 
-    # ── 存入 ChromaDB ─────────────────────────────────────────────────────────
     print(f"\n存入 ChromaDB：{CHROMA_DIR}")
     os.makedirs(CHROMA_DIR, exist_ok=True)
     chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
 
-    print(f"\n寫入法條 collection…")
-    populate_collection(chroma_client, COLLECTION_LAW, law_texts, law_metas, law_emb)
+    print("\n寫入法條 collection…")
+    populate_collection(chroma_client, COLLECTION_LAW, law_texts, law_metas, law_embs)
 
-    print(f"\n寫入案例 collection…")
-    populate_collection(chroma_client, COLLECTION_CASES, case_texts, case_metas, case_emb)
+    print("\n寫入案例 collection…")
+    populate_collection(chroma_client, COLLECTION_CASES, case_texts, case_metas, case_embs)
 
     elapsed = time.perf_counter() - t_total
     print(f"\n完成！總時間：{elapsed:.1f}s")

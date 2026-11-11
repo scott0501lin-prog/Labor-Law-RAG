@@ -1,12 +1,35 @@
 import streamlit as st
 import os
 import uuid
+import time
+import logging
 from datetime import timezone
+from typing import Iterator
+
+# sqlite3 swap for Linux (Chroma requires SQLite >= 3.35; Ubuntu 20.04 ships 3.31)
+# Must run before any 'import chromadb' anywhere in this process.
+import sys as _sys_init, platform as _platform_init
+if _platform_init.system() == "Linux":
+    try:
+        import pysqlite3 as _pysqlite3
+        _sys_init.modules["sqlite3"] = _pysqlite3
+    except ImportError:
+        pass
+del _sys_init, _platform_init
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from db import init_indexes, register_user, verify_user, save_chat, list_chats, load_chat
 from i18n import LANGUAGES, DB_MSG_KEYS, t
+from intent_config import (
+    ENABLE_INTENT_DETECTION,
+    MAX_FOLLOWUP_ROUNDS,
+    SKIP_FOLLOWUP_TRIGGERS,
+    SKIP_MAX_LEN,
+    MISSING_FIELDS_LABELS,
+    INTENT_ANALYSIS_PROMPT,
+    OVERTIME_EXTRACTION_PROMPT,
+)
 
 st.set_page_config(
     page_title="勞資爭議智慧法務 AI 顧問",
@@ -18,7 +41,54 @@ st.set_page_config(
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(base_dir, ".env"))
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "chroma").lower()
+
+EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3").lower()
+if "text2vec" in EMBED_MODEL:
+    _MODEL_NAME    = "shibing624/text2vec-base-chinese"
+    _MODEL_SUFFIX  = ""
+else:
+    _MODEL_NAME    = "BAAI/bge-m3"
+    _MODEL_SUFFIX  = "_bgem3"
+_LAW_COL_NAME   = f"law_chunks{_MODEL_SUFFIX}"
+_CASES_COL_NAME = f"cases_chunks{_MODEL_SUFFIX}"
+
+
+def _resolve_chroma_path() -> str:
+    """Return writable path for ChromaDB; falls back to tempdir if preferred path fails.
+
+    Chroma's native HNSW writer can't handle non-ASCII paths on Windows (e.g. a
+    project under "新增資料夾"): it silently writes no index files, so every
+    restart hits "Error loading hnsw index" and rebuilds. Such paths are
+    redirected to an ASCII directory under LOCALAPPDATA.
+    """
+    import tempfile
+    preferred = os.getenv(
+        "CHROMA_DB_PATH",
+        os.path.join(base_dir, "backend", "chroma_db"),
+    )
+    if not preferred.isascii():
+        fallback = os.path.join(
+            os.getenv("LOCALAPPDATA") or os.path.expanduser("~"), "law_rag", "chroma_db"
+        )
+        print(f"[CHROMA] 路徑含非 ASCII 字元，改用：{fallback}", flush=True)
+        preferred = fallback
+    try:
+        os.makedirs(preferred, exist_ok=True)
+        probe = os.path.join(preferred, ".write_probe")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        return preferred
+    except (OSError, PermissionError):
+        tmp = os.path.join(tempfile.gettempdir(), "chroma_db")
+        os.makedirs(tmp, exist_ok=True)
+        return tmp
+
+
+_CHROMA_DB_PATH = _resolve_chroma_path()
 
 
 # ==========================================
@@ -36,6 +106,11 @@ defaults = {
     "current_chat_id": None,
     "btn_input": None,
     "ui_lang": "繁體中文",
+    # intent-detection state (reset when a complete RAG answer is given)
+    "intent_ctx": None,    # dict with original_query/translated_query/scenario/known_info
+    "followup_count": 0,   # number of follow-up rounds completed in current dialog
+    "_pending_cases": None,  # list[(text, meta, score)] from last RAG query; shown on button click
+    "_show_cases": False,    # whether the case panel is expanded
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -47,6 +122,24 @@ def inject_css():
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700&family=Inter:wght@400;500;600&display=swap');
 
+    /* ── 色票（墨綠 + 燕麥） ── */
+    :root {
+        --green-900: #0f2318;
+        --green-800: #1a3a28;
+        --green-700: #24512f;  /* sidebar hover */
+        --green-600: #2d6a3f;
+        --green-500: #3d8a55;
+        --oat-100:   #faf8f4;  /* 最淺燕麥 */
+        --oat-200:   #f3ede0;  /* 主背景 */
+        --oat-300:   #e6dece;  /* 分隔 / border */
+        --oat-400:   #c9bfa8;  /* 次要 border */
+        --oat-600:   #7a6e58;  /* 次要文字 */
+        --oat-900:   #1e1a14;  /* 主文字 */
+        --accent:    #8b6c2a;  /* 金銅色 accent */
+        --accent-lt: #c9a84c;  /* 金色高亮 */
+        --white:     #ffffff;
+    }
+
     html, body, .stApp {
         font-family: 'Noto Sans TC', 'Inter', -apple-system, sans-serif !important;
     }
@@ -55,12 +148,13 @@ def inject_css():
     #MainMenu, footer { visibility: hidden; }
     .stDeployButton { display: none !important; }
 
-    /* 主背景 */
-    .stApp { background: #f0f4f8; }
+    /* ── 主背景（燕麥色） ── */
+    .stApp { background: var(--oat-200) !important; }
 
-    /* ── 側邊欄 ── */
+    /* ── 側邊欄（墨綠漸層） ── */
     [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #1a2744 0%, #243257 100%) !important;
+        background: linear-gradient(180deg, var(--green-900) 0%, var(--green-800) 100%) !important;
+        border-right: 1px solid rgba(255,255,255,0.06) !important;
     }
     [data-testid="stSidebar"] p,
     [data-testid="stSidebar"] span,
@@ -69,15 +163,15 @@ def inject_css():
     [data-testid="stSidebar"] h1,
     [data-testid="stSidebar"] h2,
     [data-testid="stSidebar"] h3 {
-        color: #dde3f0 !important;
+        color: #d4e8da !important;
     }
     section[data-testid="stSidebar"] button,
     section[data-testid="stSidebar"] .stButton > button,
     section[data-testid="stSidebar"] div[data-testid="stButton"] > button {
-        background-color: #1e3060 !important;
-        background: #1e3060 !important;
-        color: #dde3f0 !important;
-        border: 1px solid rgba(255,255,255,0.15) !important;
+        background-color: rgba(255,255,255,0.07) !important;
+        background: rgba(255,255,255,0.07) !important;
+        color: #d4e8da !important;
+        border: 1px solid rgba(255,255,255,0.12) !important;
         border-radius: 8px !important;
         font-size: 0.875rem;
         text-align: left;
@@ -85,92 +179,94 @@ def inject_css():
     }
     section[data-testid="stSidebar"] button:hover,
     section[data-testid="stSidebar"] .stButton > button:hover {
-        background-color: rgba(201,168,76,0.25) !important;
-        background: rgba(201,168,76,0.25) !important;
-        border-color: rgba(201,168,76,0.55) !important;
-        color: #f5e090 !important;
+        background-color: rgba(201,168,76,0.2) !important;
+        background: rgba(201,168,76,0.2) !important;
+        border-color: rgba(201,168,76,0.5) !important;
+        color: #f0d98a !important;
     }
     section[data-testid="stSidebar"] button:focus,
     section[data-testid="stSidebar"] button:active,
     section[data-testid="stSidebar"] .stButton > button:focus,
     section[data-testid="stSidebar"] .stButton > button:active {
-        background-color: #1e3060 !important;
-        background: #1e3060 !important;
-        color: #dde3f0 !important;
+        background-color: rgba(255,255,255,0.07) !important;
+        background: rgba(255,255,255,0.07) !important;
+        color: #d4e8da !important;
         box-shadow: none !important;
     }
     [data-testid="stSidebar"] hr {
-        border-color: rgba(255,255,255,0.1) !important;
+        border-color: rgba(255,255,255,0.08) !important;
     }
 
     /* selectbox in sidebar */
     [data-testid="stSidebar"] [data-baseweb="select"] > div {
-        background: rgba(255,255,255,0.1) !important;
-        border-color: rgba(255,255,255,0.2) !important;
+        background: rgba(255,255,255,0.09) !important;
+        border-color: rgba(255,255,255,0.18) !important;
         border-radius: 8px !important;
-        color: #dde3f0 !important;
+        color: #d4e8da !important;
     }
-    [data-testid="stSidebar"] [data-baseweb="select"] svg { fill: #dde3f0 !important; }
+    [data-testid="stSidebar"] [data-baseweb="select"] svg { fill: #d4e8da !important; }
 
     /* ── 標題 ── */
-    h1 { color: #1a2744 !important; font-weight: 700 !important; letter-spacing: -0.3px; }
-    h2, h3 { color: #243257 !important; font-weight: 600 !important; }
+    h1 { color: var(--green-800) !important; font-weight: 700 !important; letter-spacing: -0.3px; }
+    h2, h3 { color: var(--green-700) !important; font-weight: 600 !important; }
 
     /* ── Tabs ── */
     .stTabs [data-baseweb="tab-list"] {
         gap: 4px;
-        border-bottom: 2px solid #d1dae8;
+        border-bottom: 2px solid var(--oat-300);
         background: transparent;
     }
     .stTabs [data-baseweb="tab"] {
         border-radius: 8px 8px 0 0;
         padding: 0.55rem 1.4rem;
         font-weight: 500;
-        color: #64748b;
+        color: var(--oat-600);
         background: transparent;
     }
     .stTabs [aria-selected="true"] {
-        color: #1a2744 !important;
-        background: white !important;
-        border-top: 3px solid #c9a84c !important;
+        color: var(--green-800) !important;
+        background: var(--oat-100) !important;
+        border-top: 3px solid var(--accent-lt) !important;
         font-weight: 600;
     }
 
     /* ── 輸入框 ── */
     .stTextInput > div > div > input {
         border-radius: 8px !important;
-        border: 1.5px solid #c8d4e3 !important;
+        border: 1.5px solid var(--oat-300) !important;
         padding: 0.55rem 1rem !important;
         font-size: 0.95rem;
-        background: white !important;
+        background: var(--oat-100) !important;
+        color: var(--oat-900) !important;
         transition: border-color 0.18s;
     }
     .stTextInput > div > div > input:focus {
-        border-color: #1a2744 !important;
-        box-shadow: 0 0 0 3px rgba(26,39,68,0.08) !important;
+        border-color: var(--green-600) !important;
+        box-shadow: 0 0 0 3px rgba(45,106,63,0.10) !important;
+        background: var(--white) !important;
     }
 
     /* ── 一般按鈕（主內容區） ── */
     .main .stButton > button {
         border-radius: 8px !important;
         font-weight: 500 !important;
-        border: 1.5px solid #c0ccdd !important;
-        color: #1a2744 !important;
-        background: white !important;
+        border: 1.5px solid var(--oat-300) !important;
+        color: var(--green-800) !important;
+        background: var(--oat-100) !important;
         transition: all 0.18s ease !important;
     }
     .main .stButton > button:hover {
-        background: #1a2744 !important;
-        color: white !important;
-        border-color: #1a2744 !important;
-        box-shadow: 0 4px 14px rgba(26,39,68,0.18) !important;
+        background: var(--green-800) !important;
+        color: var(--oat-100) !important;
+        border-color: var(--green-800) !important;
+        box-shadow: 0 4px 14px rgba(15,35,24,0.20) !important;
         transform: translateY(-1px);
     }
 
     /* ── 表單送出按鈕 ── */
     [data-testid="stFormSubmitButton"] > button {
-        background: linear-gradient(135deg, #1a2744, #2a4080) !important;
-        color: white !important;
+        background: linear-gradient(135deg, var(--green-900), var(--green-700)) !important;
+        color: #d4e8da !important;
         border: none !important;
         border-radius: 8px !important;
         font-weight: 600 !important;
@@ -180,8 +276,8 @@ def inject_css():
         transition: all 0.18s ease !important;
     }
     [data-testid="stFormSubmitButton"] > button:hover {
-        background: linear-gradient(135deg, #243257, #1a2744) !important;
-        box-shadow: 0 6px 20px rgba(26,39,68,0.35) !important;
+        background: linear-gradient(135deg, var(--green-800), var(--green-600)) !important;
+        box-shadow: 0 6px 20px rgba(15,35,24,0.35) !important;
         transform: translateY(-1px);
     }
 
@@ -189,34 +285,75 @@ def inject_css():
     .stAlert { border-radius: 12px !important; }
 
     /* ── 聊天訊息 ── */
-    [data-testid="stChatMessage"] { border-radius: 12px !important; }
+    [data-testid="stChatMessage"] {
+        border-radius: 12px !important;
+        background: var(--oat-100) !important;
+        border: 1px solid var(--oat-300) !important;
+    }
 
     /* ── 分隔線 ── */
-    hr { border-color: #dde3f0 !important; margin: 0.8rem 0 !important; }
+    hr { border-color: var(--oat-300) !important; margin: 0.8rem 0 !important; }
 
     /* ── 登入頁置中 ── */
     .login-wrapper {
         max-width: 440px;
         margin: 0 auto;
         padding: 2.5rem 2rem;
-        background: white;
+        background: var(--oat-100);
         border-radius: 16px;
-        box-shadow: 0 4px 24px rgba(26,39,68,0.10);
+        border: 1px solid var(--oat-300);
+        box-shadow: 0 4px 24px rgba(15,35,24,0.10);
     }
 
     /* ── Landing 身份卡片 ── */
     .role-card {
-        background: white;
+        background: var(--oat-100);
         border-radius: 14px;
         padding: 1.8rem;
-        box-shadow: 0 2px 12px rgba(26,39,68,0.08);
+        box-shadow: 0 2px 12px rgba(15,35,24,0.07);
         border: 2px solid transparent;
         transition: border-color 0.18s, box-shadow 0.18s;
         height: 100%;
     }
-    .role-card:hover { border-color: #c9a84c; box-shadow: 0 6px 24px rgba(26,39,68,0.14); }
-    .role-card h3 { margin-top: 0; font-size: 1.15rem; }
-    .role-card p { color: #4a5568; font-size: 0.92rem; line-height: 1.6; margin-bottom: 1.2rem; }
+    .role-card:hover {
+        border-color: var(--accent-lt);
+        box-shadow: 0 6px 24px rgba(15,35,24,0.13);
+    }
+    .role-card h3 { margin-top: 0; font-size: 1.15rem; color: var(--green-800) !important; }
+    .role-card p { color: var(--oat-600); font-size: 0.92rem; line-height: 1.6; margin-bottom: 1.2rem; }
+
+    /* ── 使用者 / AI 訊息泡泡區別 ── */
+    [data-testid="stChatMessage"][data-testid*="user"] {
+        background: #eef7f0 !important;
+        border-left: 3px solid var(--green-600) !important;
+    }
+    [data-testid="stChatMessage"][data-testid*="assistant"] {
+        background: var(--oat-100) !important;
+        border-left: 3px solid var(--accent-lt) !important;
+    }
+
+    /* ── 聊天輸入框 ── */
+    [data-testid="stChatInput"] textarea {
+        background: var(--oat-100) !important;
+        border: 1.5px solid var(--oat-300) !important;
+        border-radius: 10px !important;
+        color: var(--oat-900) !important;
+    }
+    [data-testid="stChatInput"] textarea:focus {
+        border-color: var(--green-600) !important;
+        box-shadow: 0 0 0 3px rgba(45,106,63,0.10) !important;
+    }
+
+    /* ── expander（案例卡片）── */
+    [data-testid="stExpander"] {
+        background: var(--oat-100) !important;
+        border: 1px solid var(--oat-300) !important;
+        border-radius: 10px !important;
+    }
+    [data-testid="stExpander"] summary {
+        color: var(--green-800) !important;
+        font-weight: 500;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -232,201 +369,654 @@ def render_language_switcher():
 @st.cache_resource(show_spinner="正在載入索引...")
 def _load_index():
     import json
+    import time
     import numpy as np
     from sentence_transformers import SentenceTransformer
 
     emb_dir = os.path.join(base_dir, "backend", "embeddings")
-    model   = SentenceTransformer("shibing624/text2vec-base-chinese")
+
+    t0 = time.perf_counter()
+    model = SentenceTransformer(_MODEL_NAME)
+    load_time = time.perf_counter() - t0
 
     def _load(prefix):
-        emb  = np.load(os.path.join(emb_dir, f"{prefix}_embeddings.npy"))
-        with open(os.path.join(emb_dir, f"{prefix}_docs.json"), encoding="utf-8") as f:
+        npy_path = os.path.join(emb_dir, f"{prefix}_embeddings{_MODEL_SUFFIX}.npy")
+        if not os.path.exists(npy_path):
+            raise FileNotFoundError(
+                f"索引檔不存在：{npy_path}\n"
+                f"請先執行：python backend/build_index.py\n"
+                f"或設定 EMBED_MODEL=text2vec 使用現有索引"
+            )
+        emb  = np.load(npy_path)
+        with open(os.path.join(emb_dir, f"{prefix}_docs{_MODEL_SUFFIX}.json"), encoding="utf-8") as f:
             data = json.load(f)
         return emb, data["texts"], data["metas"]
 
     law_emb,  law_texts,  law_metas  = _load("law")
     case_emb, case_texts, case_metas = _load("cases")
+
+    dim = law_emb.shape[1]
+    try:
+        import psutil as _ps
+        rss = _ps.Process().memory_info().rss / 1024 ** 2
+        t_enc = time.perf_counter()
+        model.encode(["test"], normalize_embeddings=True)
+        enc_ms = (time.perf_counter() - t_enc) * 1000
+        print(f"[MODEL] {_MODEL_NAME} | dim={dim} | load={load_time:.1f}s | RSS={rss:.0f}MB | encode={enc_ms:.0f}ms", flush=True)
+    except ImportError:
+        print(f"[MODEL] {_MODEL_NAME} | dim={dim} | load={load_time:.1f}s", flush=True)
+    print(f"[INDEX] law={len(law_texts)} cases={len(case_texts)} total={len(law_texts)+len(case_texts)}", flush=True)
+
     return model, law_emb, law_texts, law_metas, case_emb, case_texts, case_metas
 
 
-def _search(model, query, embeddings, texts, metas, top_k=3):
+# ── ChromaDB helpers ───────────────────────────────────────────────────────
+
+def _sanitize_meta(embed_text: str, meta: dict) -> dict:
+    """Return a Chroma-compatible metadata dict (no None values)."""
+    return {
+        "embed_text": embed_text,
+        "article_no": meta.get("article_no") or "",
+        "source":     meta.get("source") or "",
+        "parent_id":  meta.get("parent_id") or "",
+        "chunk_idx":  int(meta.get("chunk_idx") or 0),
+        "category":   meta.get("category") or "",
+        "title":      meta.get("title") or "",
+        "url":        meta.get("url") or "",
+    }
+
+
+def _build_chroma_collections(client, emb_dir, law_texts, law_metas, case_texts, case_metas):
+    """Populate law_chunks + cases_chunks from existing .npy / .json. No re-encoding."""
+    import numpy as np
+
+    def _populate(prefix, col_name, texts, metas):
+        npy_path = os.path.join(emb_dir, f"{prefix}_embeddings{_MODEL_SUFFIX}.npy")
+        if not os.path.exists(npy_path):
+            raise FileNotFoundError(
+                f"索引檔不存在：{npy_path}\n"
+                f"請先執行：python backend/build_index.py"
+            )
+        emb = np.load(npy_path)
+        try:
+            client.delete_collection(col_name)
+        except Exception:
+            pass
+        col = client.create_collection(col_name, metadata={"hnsw:space": "cosine"})
+        ids       = [f"{prefix}_{i}" for i in range(len(texts))]
+        documents = [m.get("display_text", t) for t, m in zip(texts, metas)]
+        metadatas = [_sanitize_meta(t, m) for t, m in zip(texts, metas)]
+        BATCH = 1000
+        for s in range(0, len(ids), BATCH):
+            col.add(
+                ids=ids[s:s + BATCH],
+                embeddings=emb[s:s + BATCH].tolist(),
+                documents=documents[s:s + BATCH],
+                metadatas=metadatas[s:s + BATCH],
+            )
+
+    _populate("law",   _LAW_COL_NAME,   law_texts,  law_metas)
+    _populate("cases", _CASES_COL_NAME, case_texts, case_metas)
+
+
+@st.cache_resource(show_spinner="正在準備索引…")
+def _load_chroma_index():
+    """Load or build ChromaDB collections.
+
+    Returns the 7-tuple on success, or None when both load and rebuild fail —
+    callers must fall back to the NumPy path in that case.
+    """
+    import chromadb, json, shutil
+    from sentence_transformers import SentenceTransformer
+
+    emb_dir = os.path.join(base_dir, "backend", "embeddings")
+
+    def _load_json(prefix):
+        with open(os.path.join(emb_dir, f"{prefix}_docs{_MODEL_SUFFIX}.json"), encoding="utf-8") as f:
+            d = json.load(f)
+        return d["texts"], d["metas"]
+
+    law_texts,  law_metas  = _load_json("law")
+    case_texts, case_metas = _load_json("cases")
+
+    def _try_load(rebuild: bool):
+        if rebuild:
+            print(f"[CHROMA] 索引損壞，刪除重建：{_CHROMA_DB_PATH}", flush=True)
+            shutil.rmtree(_CHROMA_DB_PATH, ignore_errors=True)
+            os.makedirs(_CHROMA_DB_PATH, exist_ok=True)
+
+        client   = chromadb.PersistentClient(path=_CHROMA_DB_PATH)
+        existing = {c.name for c in client.list_collections()}
+
+        need_build = _LAW_COL_NAME not in existing or _CASES_COL_NAME not in existing
+        if not need_build:
+            law_tmp   = client.get_collection(_LAW_COL_NAME)
+            cases_tmp = client.get_collection(_CASES_COL_NAME)
+            if law_tmp.count() != len(law_texts) or cases_tmp.count() != len(case_texts):
+                need_build = True
+
+        if need_build:
+            _build_chroma_collections(client, emb_dir, law_texts, law_metas, case_texts, case_metas)
+
+        law_col   = client.get_collection(_LAW_COL_NAME)
+        cases_col = client.get_collection(_CASES_COL_NAME)
+        return law_col, cases_col
+
+    # First attempt (no rebuild)
+    try:
+        law_col, cases_col = _try_load(rebuild=False)
+        print(f"[CHROMA] 索引就緒：law={law_col.count()}, cases={cases_col.count()}", flush=True)
+    except Exception as e:
+        print(f"[CHROMA] 載入失敗：{e}", flush=True)
+        print("[CHROMA] 嘗試刪除重建…", flush=True)
+        # Second attempt: wipe and rebuild from .npy / .json
+        try:
+            law_col, cases_col = _try_load(rebuild=True)
+            print(f"[CHROMA] 重建成功：law={law_col.count()}, cases={cases_col.count()}", flush=True)
+        except Exception as e2:
+            print(f"[CHROMA] 重建仍失敗，退回 NumPy 路徑：{e2}", flush=True)
+            return None  # caller detects None and uses numpy
+
+    import time as _time
+    t0 = _time.perf_counter()
+    model = SentenceTransformer(_MODEL_NAME)
+    load_time = _time.perf_counter() - t0
+    t_enc = _time.perf_counter()
+    sample = model.encode(["test"], normalize_embeddings=True)
+    enc_ms = (_time.perf_counter() - t_enc) * 1000
+    dim = sample.shape[1]
+    try:
+        import psutil as _ps
+        rss = _ps.Process().memory_info().rss / 1024 ** 2
+        print(f"[MODEL] {_MODEL_NAME} | dim={dim} | load={load_time:.1f}s | RSS={rss:.0f}MB | encode={enc_ms:.0f}ms", flush=True)
+    except ImportError:
+        print(f"[MODEL] {_MODEL_NAME} | dim={dim} | load={load_time:.1f}s | encode={enc_ms:.0f}ms", flush=True)
+    print(f"[INDEX] law={law_col.count()} cases={cases_col.count()} total={law_col.count()+cases_col.count()}", flush=True)
+
+    return model, law_col, cases_col, law_texts, law_metas, case_texts, case_metas
+
+
+def _search(model, query, embeddings, texts, metas, top_k=5, _top_k_chunks=20):
     import numpy as np
     q_emb = model.encode([query], normalize_embeddings=True)
     scores = (embeddings @ q_emb.T).flatten()
-    top_idx = np.argsort(scores)[::-1][:top_k]
-    return [(texts[i], metas[i], float(scores[i])) for i in top_idx]
+    top_idx = np.argsort(scores)[::-1][:_top_k_chunks]
+
+    # 以 parent_id 合併：同一份文件只保留分數最高的那塊
+    seen = {}
+    for i in top_idx:
+        pid = metas[i].get("parent_id", str(i))
+        if pid not in seen or scores[i] > seen[pid][1]:
+            seen[pid] = (i, float(scores[i]))
+
+    merged = sorted(seen.values(), key=lambda x: x[1], reverse=True)[:top_k]
+    return [(texts[i], metas[i], score) for i, score in merged]
 
 
-# 加班費是最常被問、也最容易被 embedding 檢索漏掉的主題（問句越長、細節越多，
-# 排名越不穩定）。偵測到這些關鍵字時，強制把核心條文塞進結果，不依賴 embedding 排名。
-#
-# 「換補休」類提問實際對應的法條是第 32-1 條（補休轉換規則），跟第 24/32/36 條
-# （加班費倍率、工時上限、休息日）關聯度較低；若混在同一組關鍵字裡，會對換補休
-# 問題硬塞不對題的加班費條文。因此拆成兩組、依優先序互斥處理：換補休類優先比對，
-# 命中就只保底第 32-1 條；否則才落回一般加班費/工時類的保底。
-COMP_LEAVE_KEYWORDS = ["補休", "換休", "以休代薪", "代替休假"]
-COMP_LEAVE_FORCE_ARTICLES = {"第 32-1 條"}
+def _chroma_search(model, collection, query, top_k=5, _top_k_chunks=20):
+    """ChromaDB equivalent of _search(); returns [(text, meta, score)] in the same format."""
+    q_emb = model.encode([query], normalize_embeddings=True)  # (1, 768), L2-normalized
+    results = collection.query(
+        query_embeddings=[q_emb[0].tolist()],
+        n_results=_top_k_chunks,
+        include=["documents", "metadatas", "distances"],
+    )
+    docs      = results["documents"][0]
+    metas_raw = results["metadatas"][0]
+    distances = results["distances"][0]
 
-OVERTIME_KEYWORDS = ["加班", "延長工作時間", "延長工時", "休息日工作", "例假工作", "假日加班"]
-OVERTIME_FORCE_ARTICLES = {"第 24 條", "第 32 條", "第 36 條"}
+    # cosine distance ∈ [0, 2]; score = 1 - dist (0→identical, 1→orthogonal)
+    seen = {}  # parent_id → (text, meta, score)
+    for doc, raw_meta, dist in zip(docs, metas_raw, distances):
+        score = 1.0 - dist
+        pid   = raw_meta.get("parent_id", "")
+        if pid not in seen or score > seen[pid][2]:
+            meta = dict(raw_meta)
+            meta["display_text"] = doc       # restore display_text stored in documents
+            text = meta.pop("embed_text", doc)
+            seen[pid] = (text, meta, score)
 
-TERMINATION_KEYWORDS = ["資遣", "預告", "解僱", "解雇", "終止契約", "預告期間", "預告工資",
-                        "合法解僱", "解僱事由", "終止勞動契約"]
-TERMINATION_FORCE_ARTICLES = {"第 11 條", "第 12 條", "第 13 條", "第 14 條", "第 16 條", "第 17 條"}
-
-LEAVE_KEYWORDS = ["特別休假", "年假", "休假天數", "特休"]
-LEAVE_FORCE_ARTICLES = {"第 38 條"}
-
-HOLIDAY_KEYWORDS = ["國定假日", "例假", "休息日", "國假", "補休", "假日出勤", "假日上班", "輪班假日"]
-HOLIDAY_FORCE_ARTICLES = {"第 36 條", "第 37 條", "第 39 條"}
-
-# 「休息日出勤超過 8 小時，第 9 小時起計給 2 又 2/3 倍」出自勞動部勞動條 2 字第
-# 1050030466 號書函，但這筆函釋在 embedding 檢索排名不穩定、常常掉出前 5 名
-# （見 backend/derived_interpretations.json），所以跟法條一樣用關鍵字強制帶入。
-# 只在「休息日」與加班關鍵字同時出現時才觸發，避免非休息日的一般加班問題也被硬塞。
-RESTDAY_OVERTIME_FORCE_TITLES = {"勞動部勞動條 2 字第 1050030466 號書函"}
+    ranked = sorted(seen.values(), key=lambda x: x[2], reverse=True)
+    return ranked[:top_k]
 
 
-def _force_include_articles(query, results, texts, metas, keywords, force_article_nos, source="勞動基準法"):
-    # 法條索引現在同時混了勞基法本法與施行細則，兩者的 article_no 可能撞號
-    # （例如兩邊都各自有自己的「第 24 條」），所以強制帶入時一定要限定
-    # source，否則可能誤把施行細則裡不相關的同號條文塞進來。
-    if not any(k in query for k in keywords):
-        return results
-    existing = {m.get("article_no") for _, m, _ in results}
-    forced = [
-        (texts[i], m, None)
-        for i, m in enumerate(metas)
-        if m.get("article_no") in force_article_nos
-        and m.get("article_no") not in existing
-        and m.get("source") == source
-    ]
-    return forced + results
+# Force-include rules, constants, and helper functions live in force_rules.py
+# so eval/test_force_rules.py can import the real implementation without
+# pulling in Streamlit / Gemini / numpy.
+from force_rules import (
+    FORCE_ARTICLE_RULES,
+    MAX_FORCED_LAW_RESULTS,
+    RESTDAY_OVERTIME_FORCE_TITLES,
+    _force_include_articles,
+    _force_include_cases,
+)
+from referral_text import REFERRAL_BLOCK
+from prompt_helpers import (
+    OUT_OF_SCOPE_TEXT,
+    build_system_prompt,
+    build_lang_rule,
+    build_missing_note,
+    build_user_prompt,
+    stream_reply,
+)
 
 
-def _force_include_cases(query, results, texts, metas, keywords, force_titles):
-    if not any(k in query for k in keywords) or "休息日" not in query:
-        return results
-    existing = {m.get("title") for _, m, _ in results}
-    forced = [
-        (texts[i], m, None)
-        for i, m in enumerate(metas)
-        if m.get("title") in force_titles and m.get("title") not in existing
-    ]
-    return forced + results
+# ==========================================
+# 3b. 意圖判斷 + 情境追問輔助函式
+# ==========================================
+import json as _json
+import re as _re
+
+# Retry only when the stream fails before any text was shown to the user
+CLAUDE_MAX_ATTEMPTS = 2
+CLAUDE_MODEL = "claude-haiku-5-5"
+
+
+@st.cache_resource
+def _get_anthropic_client(api_key: str):
+    """Shared Anthropic client — cached to avoid repeated TLS setup."""
+    import anthropic as _ant
+    return _ant.Anthropic(api_key=api_key)
+
+
+def _claude_json_call(prompt_text: str, _label: str = "intent") -> dict | None:
+    """Fire a Claude call and return parsed JSON dict, or None on any failure."""
+    try:
+        api_key = ANTHROPIC_API_KEY or os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            print(f"[INTENT] [{_label}] API key 未設定，略過")
+            return None
+        client = _get_anthropic_client(api_key)
+        resp = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt_text}],
+        )
+        text = resp.content[0].text.strip()
+        print(f"[INTENT] [{_label}] Claude 原始回傳: {text!r}")
+        m = _re.search(r'\{.*\}', text, _re.DOTALL)
+        if m:
+            text = m.group()
+        result = _json.loads(text)
+        print(f"[INTENT] [{_label}] 解析成功")
+        return result
+    except Exception as _e:
+        print(f"[INTENT] [{_label}] 解析失敗: {_e}")
+        return None
+
+
+def _analyze_intent(user_message: str, known_info: dict, ui_lang: str) -> dict | None:
+    """First-pass: classify intent, detect scenario, extract known fields.
+
+    Returns a dict with keys: translated_query, intent, scenario, known_info,
+    missing_fields, follow_up. Returns None on JSON parse failure (caller falls
+    back to the original RAG flow).
+    """
+    print(f"[INTENT] _analyze_intent 呼叫 | 問句: {user_message!r}")
+    prompt = INTENT_ANALYSIS_PROMPT.format(
+        user_message=user_message,
+        known_info_json=_json.dumps(known_info, ensure_ascii=False),
+        ui_lang=ui_lang,
+    )
+    result = _claude_json_call(prompt, _label="analyze_intent")
+    if result:
+        print(f"[INTENT]   intent       = {result.get('intent')!r}")
+        print(f"[INTENT]   scenario     = {result.get('scenario')!r}")
+        print(f"[INTENT]   known_info   = {result.get('known_info')}")
+        print(f"[INTENT]   missing_fields = {result.get('missing_fields')}")
+        print(f"[INTENT]   follow_up    = {result.get('follow_up')!r}")
+    else:
+        print("[INTENT] _analyze_intent: 結果為 None（解析失敗）")
+    return result
+
+
+def _extract_overtime_fields(user_message: str, known_info: dict, ui_lang: str) -> dict | None:
+    """Mid-dialog extraction: parse field values from a follow-up answer.
+
+    Does NOT re-classify intent. Returns a dict with is_new_question, known_info,
+    missing_fields, follow_up. Returns None on failure (caller falls back).
+    """
+    print(f"[INTENT] _extract_overtime_fields 呼叫 | 回覆: {user_message!r}")
+    prompt = OVERTIME_EXTRACTION_PROMPT.format(
+        user_message=user_message,
+        known_info_json=_json.dumps(known_info, ensure_ascii=False),
+        ui_lang=ui_lang,
+    )
+    result = _claude_json_call(prompt, _label="extract_fields")
+    if result:
+        print(f"[INTENT]   is_new_question = {result.get('is_new_question')}")
+        print(f"[INTENT]   known_info      = {result.get('known_info')}")
+        print(f"[INTENT]   missing_fields  = {result.get('missing_fields')}")
+        print(f"[INTENT]   follow_up       = {result.get('follow_up')!r}")
+    else:
+        print("[INTENT] _extract_overtime_fields: 結果為 None（解析失敗）")
+    return result
+
+
+def _build_enriched_query(translated_query: str, known_info: dict) -> str:
+    """Append collected field values to translated_query for a richer RAG search."""
+    parts = [translated_query]
+    if known_info.get("day_type"):
+        parts.append(known_info["day_type"])
+    if known_info.get("hours") is not None:
+        parts.append(f"加班 {known_info['hours']} 小時")
+    if known_info.get("wage_type") and known_info.get("wage_amount"):
+        parts.append(f"{known_info['wage_type']} {known_info['wage_amount']} 元")
+    elif known_info.get("wage_type"):
+        parts.append(known_info["wage_type"])
+    elif known_info.get("wage_amount"):
+        parts.append(f"薪資 {known_info['wage_amount']} 元")
+    if known_info.get("compensation_type"):
+        parts.append(known_info["compensation_type"])
+    return "，".join(parts)
+
+
+def _handle_prompt(prompt: str, persona: str, lang: str) -> str | Iterator[str]:
+    """Route a user prompt through intent detection + optional follow-up + RAG.
+
+    Falls back to query_rag_system() directly whenever intent detection is
+    disabled, JSON parsing fails, or the scenario is not overtime_pay.
+    """
+    print(f"[INTENT] ── _handle_prompt ──────────────────────────────")
+    print(f"[INTENT] ENABLE_INTENT_DETECTION = {ENABLE_INTENT_DETECTION}")
+    print(f"[INTENT] 使用者問句: {prompt!r}")
+
+    def _is_skip(text: str) -> bool:
+        return (
+            len(text) <= SKIP_MAX_LEN
+            and any(kw in text for kw in SKIP_FOLLOWUP_TRIGGERS)
+        )
+
+    def _new_question(qprompt: str) -> str:
+        """Handle a fresh (non-mid-dialog) question."""
+        analysis = _analyze_intent(qprompt, {}, lang)
+        if (
+            analysis
+            and analysis.get("intent") == "solve_problem"
+            and analysis.get("scenario") == "overtime_pay"
+            and analysis.get("missing_fields")
+            and not _is_skip(qprompt)
+        ):
+            print(f"[INTENT] 分支: 追問 | follow_up={analysis.get('follow_up')!r}")
+            st.session_state.intent_ctx = {
+                "original_query":   qprompt,
+                "translated_query": analysis.get("translated_query") or qprompt,
+                "scenario":         "overtime_pay",
+                "known_info":       analysis.get("known_info") or {},
+            }
+            st.session_state.followup_count = 0
+            return analysis.get("follow_up") or ""
+        else:
+            reason = "解析失敗" if not analysis else f"intent={analysis.get('intent')!r} scenario={analysis.get('scenario')!r}"
+            print(f"[INTENT] 分支: 直接 RAG | {reason}")
+            sq = analysis.get("translated_query") if analysis else None
+            return query_rag_system(qprompt, persona, lang, search_query_override=sq)
+
+    if not ENABLE_INTENT_DETECTION:
+        print("[INTENT] 未執行: 功能關閉 (ENABLE_INTENT_DETECTION=False) → 直接 RAG")
+        return query_rag_system(prompt, persona, lang)
+
+    ctx = st.session_state.intent_ctx
+    print(f"[INTENT] intent_ctx = {'有進行中對話' if ctx else '無 (新問題)'}")
+
+    if ctx is not None:
+        # ── Mid-dialog: processing a follow-up answer ─────────────────────
+        if _is_skip(prompt):
+            print(f"[INTENT] 分支: mid-dialog 跳過 → 直接 RAG (原問句)")
+            st.session_state.intent_ctx = None
+            st.session_state.followup_count = 0
+            return query_rag_system(
+                ctx["original_query"], persona, lang,
+                search_query_override=ctx["translated_query"],
+            )
+
+        result = _extract_overtime_fields(prompt, ctx["known_info"], lang)
+        if result is None:
+            # JSON failure → fallback with what we have
+            print("[INTENT] 分支: extraction 解析失敗 → fallback RAG (原問句)")
+            st.session_state.intent_ctx = None
+            st.session_state.followup_count = 0
+            return query_rag_system(
+                ctx["original_query"], persona, lang,
+                search_query_override=ctx["translated_query"],
+            )
+
+        if result.get("is_new_question"):
+            print("[INTENT] 分支: is_new_question=True → 清空 ctx，重新分析新問題")
+            st.session_state.intent_ctx = None
+            st.session_state.followup_count = 0
+            return _new_question(prompt)
+
+        # Merge new non-null values into known_info
+        for k, v in (result.get("known_info") or {}).items():
+            if v is not None:
+                ctx["known_info"][k] = v
+        st.session_state.followup_count += 1
+        missing = result.get("missing_fields") or []
+
+        if missing and st.session_state.followup_count < MAX_FOLLOWUP_ROUNDS:
+            print(f"[INTENT] 分支: 繼續追問 (round={st.session_state.followup_count}) | missing={missing}")
+            return result.get("follow_up") or ""
+
+        # Reached limit or all fields collected → proceed to RAG
+        enriched = _build_enriched_query(ctx["translated_query"], ctx["known_info"])
+        print(f"[INTENT] 分支: 追問完成 → RAG | enriched={enriched!r} | missing={missing or None}")
+        st.session_state.intent_ctx = None
+        st.session_state.followup_count = 0
+        return query_rag_system(
+            enriched, persona, lang,
+            search_query_override=enriched,
+            missing_fields=missing or None,
+        )
+
+    else:
+        return _new_question(prompt)
 
 
 # ==========================================
 # 4. 後端 RAG 引擎 (Gemini + Numpy 搜尋)
 # ==========================================
-def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str) -> str:
-    try:
-        from google import genai
-        from google.genai import types
+_rag_logger = logging.getLogger("rag_timing")
+if not _rag_logger.handlers:
+    _rag_log_path = os.path.join(base_dir, "rag_timing.log")
+    _rag_handler = logging.FileHandler(_rag_log_path, encoding="utf-8")
+    _rag_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    _rag_logger.addHandler(_rag_handler)
+    _rag_logger.setLevel(logging.INFO)
 
-        api_key = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
+
+def query_rag_system(
+    user_prompt: str,
+    system_prompt: str,
+    ui_lang: str,
+    *,
+    search_query_override: str | None = None,
+    missing_fields: list[str] | None = None,
+) -> str | Iterator[str]:
+    """Run retrieval eagerly, then return a generator that streams the answer.
+
+    Returns a plain string for early errors (missing API key, retrieval failure).
+
+    search_query_override: pre-translated Chinese query from _analyze_intent;
+        if provided, the internal translation call is skipped.
+    missing_fields: list of required field names that were not collected;
+        if non-empty, a disclaimer is appended to final_prompt asking Gemini
+        NOT to assume values.
+    """
+    try:
+        api_key = ANTHROPIC_API_KEY or os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
             return t(ui_lang, "err_no_api_key")
 
-        client = genai.Client(api_key=api_key)
-        model, law_emb, law_texts, law_metas, case_emb, case_texts, case_metas = _load_index()
+        _t0 = time.perf_counter()
+        client = _get_anthropic_client(api_key)
+
+        _use_chroma = VECTOR_BACKEND == "chroma"
+        if _use_chroma:
+            _chroma_res = _load_chroma_index()
+            if _chroma_res is None:
+                _use_chroma = False  # fallback: chroma failed both times
+            else:
+                model, law_col, cases_col, law_texts, law_metas, case_texts, case_metas = _chroma_res
+        if not _use_chroma:
+            model, law_emb, law_texts, law_metas, case_emb, case_texts, case_metas = _load_index()
+        _t_load = time.perf_counter()
 
         def _is_chinese(text: str) -> bool:
             chinese_chars = sum(1 for c in text if "一" <= c <= "鿿")
             return chinese_chars / max(len(text), 1) >= 0.3
 
-        search_query = user_prompt
-        if not _is_chinese(user_prompt):
-            try:
-                search_query = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=f"請將以下使用者問題翻譯成繁體中文，只需要輸出翻譯結果，不要加任何說明：\n\n{user_prompt}"
-                ).text.strip()
-            except Exception:
-                search_query = user_prompt
-
-        l_results = _search(model, search_query, law_emb,  law_texts,  law_metas,  top_k=5)
-        if any(k in search_query for k in COMP_LEAVE_KEYWORDS):
-            l_results = _force_include_articles(
-                search_query, l_results, law_texts, law_metas, COMP_LEAVE_KEYWORDS, COMP_LEAVE_FORCE_ARTICLES
-            )
+        if search_query_override is not None:
+            # Translation already done by _analyze_intent — skip the extra call
+            search_query = search_query_override
         else:
-            l_results = _force_include_articles(
-                search_query, l_results, law_texts, law_metas, OVERTIME_KEYWORDS, OVERTIME_FORCE_ARTICLES
-            )
-        l_results = _force_include_articles(
-            search_query, l_results, law_texts, law_metas, TERMINATION_KEYWORDS, TERMINATION_FORCE_ARTICLES
-        )
-        l_results = _force_include_articles(
-            search_query, l_results, law_texts, law_metas, LEAVE_KEYWORDS, LEAVE_FORCE_ARTICLES
-        )
-        l_results = _force_include_articles(
-            search_query, l_results, law_texts, law_metas, HOLIDAY_KEYWORDS, HOLIDAY_FORCE_ARTICLES
-        )
-        c_results = _search(model, search_query, case_emb, case_texts, case_metas, top_k=5)
+            search_query = user_prompt
+            if not _is_chinese(user_prompt):
+                try:
+                    search_query = client.messages.create(
+                        model=CLAUDE_MODEL,
+                        max_tokens=256,
+                        messages=[{"role": "user", "content": f"請將以下使用者問題翻譯成繁體中文，只需要輸出翻譯結果，不要加任何說明：\n\n{user_prompt}"}],
+                    ).content[0].text.strip()
+                except Exception:
+                    search_query = user_prompt
+        _t_trans = time.perf_counter()
+
+        if _use_chroma:
+            l_results = _chroma_search(model, law_col, search_query, top_k=5)
+        else:
+            l_results = _search(model, search_query, law_emb, law_texts, law_metas, top_k=5)
+        _t_law_search = time.perf_counter()
+
+        fired_mutex: set = set()
+        for rule in FORCE_ARTICLE_RULES:
+            if rule["mutex"] and rule["mutex"] in fired_mutex:
+                continue
+            if any(k in search_query for k in rule["keywords"]):
+                l_results = _force_include_articles(
+                    search_query, l_results, law_texts, law_metas,
+                    rule["keywords"], rule["articles"]
+                )
+                if rule["mutex"]:
+                    fired_mutex.add(rule["mutex"])
+        l_results = l_results[:MAX_FORCED_LAW_RESULTS]
+        _t_force_l = time.perf_counter()
+
+        if _use_chroma:
+            c_results = _chroma_search(model, cases_col, search_query, top_k=5)
+        else:
+            c_results = _search(model, search_query, case_emb, case_texts, case_metas, top_k=5)
+        _t_case_search = time.perf_counter()
+
+        _overtime_kw = next(r["keywords"] for r in FORCE_ARTICLE_RULES if r["name"] == "加班延長工時")
         c_results = _force_include_cases(
-            search_query, c_results, case_texts, case_metas, OVERTIME_KEYWORDS, RESTDAY_OVERTIME_FORCE_TITLES
+            search_query, c_results, case_texts, case_metas, _overtime_kw, RESTDAY_OVERTIME_FORCE_TITLES
         )
+        _t_force_c = time.perf_counter()
 
         law_ctx = ""
         for d, m, _ in l_results:
-            law_ctx += f"【法規內容】：{d}\n【條號】：{m.get('source', '')} {m.get('article_no', '')}\n\n"
+            display = m.get("display_text", d)
+            law_ctx += f"【法規內容】：{display}\n【條號】：{m.get('source', '')} {m.get('article_no', '')}\n\n"
 
-        case_ctx = ""
-        for d, m, _ in c_results:
-            url_line = f"\n【網址】：{m['url']}" if m.get("url") else ""
-            case_ctx += f"【{m.get('source', '')} — {m.get('category', '')}】\n{d}{url_line}\n\n"
+        # c_results are saved to session_state for the "查看相似案例" button;
+        # they are NOT included in the Gemini prompt (saves tokens).
+        st.session_state["_pending_cases"] = c_results
+        st.session_state["_show_cases"]    = False
 
         # 回答語言邏輯：永遠跟著 UI 語言選項走。
-        # 使用者在語言下拉選 English → AI 用英文回答，以此類推。
-        if ui_lang != "繁體中文":
-            lang_name = LANGUAGES.get(ui_lang, "Traditional Chinese")
-            lang_rule = (
-                f"\n8. 除「📖 法條依據」區塊中的法條原文須保留繁體中文（避免翻譯造成法律歧義）外，"
-                f"其餘所有文字（結論、📂 參考案例、💡 說明）請使用「{lang_name}」撰寫；"
-                f"法條原文後方請附上一句{lang_name}白話翻譯。"
-                f"加班費倍率的數字（如 4/3、5/3、1.33、1.66）必須維持原本數值與格式，不可換算。"
-            )
-        else:
-            lang_rule = ""
+        lang_rule = build_lang_rule(ui_lang, LANGUAGES.get(ui_lang, "Traditional Chinese"))
 
-        final_prompt = f"""
-【相關法規條文】（資料庫檢索）：
-{law_ctx}
+        # Missing-fields disclaimer — only appended when fields were still absent
+        # after the follow-up dialog, so Gemini won't invent numbers.
+        labels = "、".join(MISSING_FIELDS_LABELS.get(f, f) for f in (missing_fields or []))
+        missing_note = build_missing_note(labels)
 
-【相關案例 / Q&A / 裁判書】（資料庫檢索）：
-{case_ctx}
-
-使用者問題：{user_prompt}
-
-【回答格式要求】：
-1. 先給出簡明的直接結論。
-2. 在「📖 法條依據」區塊中，逐條列出引用的法條號碼與原文：
-   > **勞動基準法 第 X 條**
-   > （條文原文）
-3. 在「📂 參考案例」區塊中，若有相關案例或 Q&A，請摘要說明並附上來源網址（可點擊連結）。
-4. 在「💡 說明」區塊中，依據以上資料說明理由與注意事項。
-5. 若資料庫無相關條文或案例，須明確說明，不可捏造。
-6. 若回答涉及加班費倍率計算（例如平日延長工時前 2 小時為 1 又 1/3 倍〈4/3，約 1.33 倍〉、
-   超過 2 小時至 4 小時為 1 又 2/3 倍〈5/3，約 1.66 倍〉），必須同時列出精確分數與約略小數
-   （例如「4/3 倍（約 1.33 倍）」），不可只寫約略小數，也不可寫成「多 33%」等容易誤解為
-   百分比加成的說法；並清楚說明此倍率是以平日每小時工資額為計算基準。
-7. 若問題涉及「依年資對應天數／期間／金額」的法條級距（例如特別休假天數、資遣預告期間、
-   資遣費／退休金計算等），作答前必須先明確判斷使用者的年資落在哪一款／哪一個級距，
-   全文只能使用該款對應的數字；「結論」與「📖 法條依據」引用的級距與數字必須完全一致，
-   不可一邊寫某一級距的天數、另一邊卻引用其他級距的法條。若年資剛好落在級距交界（例如
-   「剛滿」某年），須以該年資對應的較低級距（未滿下一級距）計算，並可在「💡 說明」中
-   註明何時會晉升到下一級距。{lang_rule}
-"""
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=final_prompt,
-            config=types.GenerateContentConfig(system_instruction=system_prompt),
-        )
-        return response.text
+        final_prompt = build_user_prompt(law_ctx, user_prompt, lang_rule, missing_note)
+        _t_prompt = time.perf_counter()
 
     except Exception as e:
         return f"🚨 異常：{str(e)}"
+
+    _stats = {"t_first": None, "usage": None, "retries": 0}
+
+    def _raw() -> Iterator[str]:
+        """Yield raw Claude text chunks, recording first-token time and usage.
+
+        Retries a failed/timed-out request only if no text was yielded yet;
+        once the user has seen part of the answer, the error is re-raised.
+        """
+        for attempt in range(1, CLAUDE_MAX_ATTEMPTS + 1):
+            emitted = False
+            try:
+                with client.messages.stream(
+                    model=CLAUDE_MODEL,
+                    max_tokens=2048,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": final_prompt}],
+                ) as stream:
+                    for text_chunk in stream.text_stream:
+                        if text_chunk:
+                            if _stats["t_first"] is None:
+                                _stats["t_first"] = time.perf_counter()
+                            emitted = True
+                            yield text_chunk
+                    final_msg = stream.get_final_message()
+                    if final_msg:
+                        _stats["usage"] = final_msg.usage
+                return
+            except Exception as e:
+                if emitted or attempt == CLAUDE_MAX_ATTEMPTS:
+                    raise
+                _stats["retries"] += 1
+                print(f"[CLAUDE] 第 {attempt} 次呼叫失敗，重試：{e}", flush=True)
+
+    def _stream() -> Iterator[str]:
+        """Stream the <answer> body; OUT scope gets the fixed referral text instead."""
+        is_out = False
+        try:
+            for piece in stream_reply(_raw()):
+                # stream_reply yields the OUT_OF_SCOPE_TEXT object itself for OUT scope
+                is_out = is_out or piece is OUT_OF_SCOPE_TEXT
+                yield piece
+        except Exception as e:
+            _rag_logger.info(
+                f"q={user_prompt[:25]!r} ERROR after {time.perf_counter()-_t_prompt:.3f}s "
+                f"retries={_stats['retries']} shown={_stats['t_first'] is not None} err={e!r}"
+            )
+            yield f"\n\n🚨 回答中斷（{type(e).__name__}），請再問一次。"
+            return
+
+        _t_claude = time.perf_counter()
+        _t_first  = _stats["t_first"]
+        _usage    = _stats["usage"]
+
+        # Token usage (Anthropic SDK: usage.input_tokens / output_tokens)
+        _input_tok  = int(getattr(_usage, "input_tokens",  0) or 0)
+        _output_tok = int(getattr(_usage, "output_tokens", 0) or 0)
+
+        _rag_logger.info(
+            f"q={user_prompt[:25]!r} zh={_is_chinese(user_prompt)} "
+            f"load={_t_load-_t0:.3f}s "
+            f"trans={_t_trans-_t_load:.3f}s "
+            f"law_search={_t_law_search-_t_trans:.3f}s "
+            f"force_l={_t_force_l-_t_law_search:.3f}s "
+            f"case_search={_t_case_search-_t_force_l:.3f}s "
+            f"force_c={_t_force_c-_t_case_search:.3f}s "
+            f"prompt={_t_prompt-_t_force_c:.3f}s "
+            f"ttft={(_t_first or _t_claude)-_t_prompt:.3f}s "
+            f"claude={_t_claude-_t_prompt:.3f}s "
+            f"total={_t_claude-_t0:.3f}s "
+            f"prompt_chars={len(final_prompt)} "
+            f"input_tok={_input_tok} output_tok={_output_tok} "
+            f"scope={'OUT' if is_out else 'IN'} retries={_stats['retries']}"
+        )
+
+        # OUT_OF_SCOPE_TEXT already lists referral channels
+        if not is_out:
+            yield REFERRAL_BLOCK
+
+    return _stream()
 
 
 # ==========================================
@@ -436,15 +1026,25 @@ def show_login_page():
     render_language_switcher()
     lang = st.session_state.ui_lang
 
-    st.markdown("<br>", unsafe_allow_html=True)
-    _, mid, _ = st.columns([1, 2, 1])
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    _, mid, _ = st.columns([1, 1.6, 1])
     with mid:
         st.markdown(
-            "<div style='text-align:center; margin-bottom:0.5rem;'>"
-            "<span style='font-size:3rem;'>⚖️</span>"
+            "<div style='"
+            "background:#faf8f4;"
+            "border:1px solid #e6dece;"
+            "border-radius:16px;"
+            "padding:2.4rem 2.2rem 2rem;"
+            "box-shadow:0 4px 24px rgba(15,35,24,0.09);"
+            "'>"
+            "<div style='text-align:center; margin-bottom:0.8rem;'>"
+            "<span style='font-size:2.6rem; line-height:1;'>⚖️</span>"
             "</div>"
-            f"<h2 style='text-align:center; color:#1a2744; font-size:1.45rem; margin-bottom:0.2rem;'>{t(lang, 'app_title').replace('⚖️ ','')}</h2>"
-            f"<p style='text-align:center; color:#64748b; margin-bottom:1.5rem; font-size:0.95rem;'>{t(lang, 'login_subheader')}</p>",
+            f"<h2 style='text-align:center; color:#1a3a28; font-size:1.4rem;"
+            f" font-weight:700; margin-bottom:0.25rem; letter-spacing:-0.2px;'>"
+            f"{t(lang, 'app_title').replace('⚖️ ', '')}</h2>"
+            f"<p style='text-align:center; color:#7a6e58; margin-bottom:1.6rem;"
+            f" font-size:0.9rem;'>{t(lang, 'login_subheader')}</p>",
             unsafe_allow_html=True,
         )
 
@@ -487,6 +1087,8 @@ def show_login_page():
                         else:
                             st.error(localized_msg)
 
+        st.markdown("</div>", unsafe_allow_html=True)
+
 
 # ==========================================
 # 5. 頁面二：身份選擇 (Landing Page)
@@ -495,25 +1097,39 @@ def show_landing_page():
     render_language_switcher()
     lang = st.session_state.ui_lang
 
+    # ── Hero ──────────────────────────────────────────────────────────────────
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown(
-        "<h1 style='text-align:center; color:#1a2744;'>⚖️ " + t(lang, "app_title").replace("⚖️ ", "") + "</h1>"
-        f"<p style='text-align:center; color:#4a5568; font-size:1.05rem; margin-bottom:0.3rem;'>{t(lang, 'landing_subheader')}</p>"
-        f"<p style='text-align:center; color:#64748b; font-size:0.9rem; margin-bottom:2rem;'>{t(lang, 'landing_desc')}</p>",
+        "<div style='text-align:center; padding:0.5rem 0 1.8rem;'>"
+        "<div style='display:inline-block; background:#1a3a28; border-radius:50%;"
+        " width:64px; height:64px; line-height:64px; font-size:2rem; margin-bottom:1rem;'>⚖️</div>"
+        "<h1 style='color:#1a3a28; font-size:1.9rem; font-weight:700; margin-bottom:0.35rem;'>"
+        + t(lang, "app_title").replace("⚖️ ", "") +
+        "</h1>"
+        f"<p style='color:#2d6a3f; font-size:1.05rem; font-weight:500; margin-bottom:0.3rem;'>"
+        f"{t(lang, 'landing_subheader')}</p>"
+        f"<p style='color:#7a6e58; font-size:0.9rem;'>{t(lang, 'landing_desc')}</p>"
+        "</div>",
         unsafe_allow_html=True,
     )
 
-    _, c1, _, c2, _ = st.columns([0.5, 3, 0.3, 3, 0.5])
+    # ── 角色卡 ────────────────────────────────────────────────────────────────
+    _, c1, _, c2, _ = st.columns([0.8, 3, 0.4, 3, 0.8])
 
     with c1:
         st.markdown(
             "<div class='role-card'>"
-            "<h3>🙋‍♂️ " + t(lang, "role_label_employee") + "</h3>"
-            f"<p>{t(lang, 'role_employee_desc')}</p>"
+            "<div style='font-size:2rem; margin-bottom:0.7rem;'>🙋</div>"
+            "<h3 style='color:#1a3a28; font-size:1.15rem; margin-bottom:0.5rem;'>"
+            + t(lang, "role_label_employee") +
+            "</h3>"
+            f"<p style='color:#7a6e58; font-size:0.9rem; line-height:1.65; margin-bottom:1.2rem;'>"
+            f"{t(lang, 'role_employee_desc')}</p>"
+            "<div style='height:3px; background:linear-gradient(90deg,#2d6a3f,#c9a84c);"
+            " border-radius:2px; margin-bottom:0.8rem;'></div>"
             "</div>",
             unsafe_allow_html=True,
         )
-        st.markdown("<div style='margin-top:0.6rem;'></div>", unsafe_allow_html=True)
         if st.button(t(lang, "role_employee_btn"), use_container_width=True, key="emp_btn"):
             st.session_state.user_role        = "Employee"
             st.session_state.page             = "Chat"
@@ -524,12 +1140,17 @@ def show_landing_page():
     with c2:
         st.markdown(
             "<div class='role-card'>"
-            "<h3>🏢 " + t(lang, "role_label_employer") + "</h3>"
-            f"<p>{t(lang, 'role_employer_desc')}</p>"
+            "<div style='font-size:2rem; margin-bottom:0.7rem;'>🏢</div>"
+            "<h3 style='color:#1a3a28; font-size:1.15rem; margin-bottom:0.5rem;'>"
+            + t(lang, "role_label_employer") +
+            "</h3>"
+            f"<p style='color:#7a6e58; font-size:0.9rem; line-height:1.65; margin-bottom:1.2rem;'>"
+            f"{t(lang, 'role_employer_desc')}</p>"
+            "<div style='height:3px; background:linear-gradient(90deg,#2d6a3f,#c9a84c);"
+            " border-radius:2px; margin-bottom:0.8rem;'></div>"
             "</div>",
             unsafe_allow_html=True,
         )
-        st.markdown("<div style='margin-top:0.6rem;'></div>", unsafe_allow_html=True)
         if st.button(t(lang, "role_employer_btn"), use_container_width=True, key="er_btn"):
             st.session_state.user_role        = "Employer"
             st.session_state.page             = "Chat"
@@ -537,8 +1158,35 @@ def show_landing_page():
             st.session_state.current_chat_id  = None
             st.rerun()
 
-    st.markdown("<br><br>", unsafe_allow_html=True)
-    st.caption(t(lang, "landing_caption").format(username=st.session_state.username))
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown(
+        f"<p style='text-align:center; color:#7a6e58; font-size:0.85rem;'>"
+        f"{t(lang, 'landing_caption').format(username=st.session_state.username)}</p>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_case_results(c_results: list, lang: str) -> None:
+    """Render similar-case cards below the answer. Called only when user clicks the button."""
+    st.markdown("---")
+    st.markdown("**🔍 相似案例** *(案例僅供參考，每件情況不同)*")
+    if not c_results:
+        st.info("未找到相似案例。")
+        return
+    for text, meta, score in c_results:
+        title    = meta.get("title") or ""
+        source   = meta.get("source") or ""
+        category = meta.get("category") or ""
+        display  = meta.get("display_text", text)
+        summary  = display[:150] + ("…" if len(display) > 150 else "")
+        url      = meta.get("url") or ""
+        header   = title or f"{source} — {category}"
+        with st.expander(f"📄 {header}", expanded=False):
+            if source or category:
+                st.markdown(f"**類別**：{source}{'  —  ' + category if category else ''}")
+            st.markdown(summary)
+            if url:
+                st.markdown(f"[🔗 查看原文]({url})")
 
 
 # ==========================================
@@ -548,15 +1196,9 @@ def show_chat_room():
     render_language_switcher()
     lang = st.session_state.ui_lang
 
+    persona = build_system_prompt(st.session_state.user_role)
     if st.session_state.user_role == "Employee":
         title   = t(lang, "chat_title_employee")
-        persona = (
-            "你是一位專業勞工法律顧問，專門協助勞工了解並保護自身的勞動權益。"
-            "你具備深厚的台灣勞動法律知識，包括勞動基準法、勞工保險條例、職業安全衛生法等。"
-            "請以友善、清晰、易懂的語氣回答問題。"
-            "回答時必須：①先給結論，②在「📖 法條依據」區塊逐條引用法條號碼與原文，"
-            "③在「💡 說明」區塊解釋理由。若資料庫無相關條文，須明確說明，不可捏造條號。"
-        )
         btns = [
             (t(lang, "qe_btn1"), "我被資遣了！我的權益是什麼？"),
             (t(lang, "qe_btn2"), "加班費怎麼算？"),
@@ -565,13 +1207,6 @@ def show_chat_room():
         ]
     else:
         title   = t(lang, "chat_title_employer")
-        persona = (
-            "你是一位專業企業勞動法律顧問，專門協助雇主和HR在合法合規的前提下管理勞資關係。"
-            "你具備深厚的台灣勞動法律知識，並能從企業管理角度提供實用建議。"
-            "請以專業、嚴謹的語氣回答。"
-            "回答時必須：①先給結論，②在「📖 法條依據」區塊逐條引用法條號碼與原文，"
-            "③在「💡 說明」區塊解釋理由與風險評估。若資料庫無相關條文，須明確說明，不可捏造條號。"
-        )
         btns = [
             (t(lang, "qr_btn1"), "合法資遣流程？"),
             (t(lang, "qr_btn2"), "員工連續曠職怎麼辦？"),
@@ -583,35 +1218,71 @@ def show_chat_room():
 
     # --- 側邊欄 ---
     with st.sidebar:
-        st.title(t(lang, "sidebar_title"))
-        st.write(t(lang, "sidebar_account").format(username=st.session_state.username))
-        st.write(t(lang, "sidebar_role").format(role=role_label))
+        # Brand header
+        st.markdown(
+            "<div style='padding:0.6rem 0 0.2rem; text-align:center;'>"
+            "<span style='font-size:1.6rem;'>⚖️</span>"
+            f"<p style='color:#d4e8da; font-size:0.78rem; margin:0.3rem 0 0;"
+            f" letter-spacing:0.5px; opacity:0.75;'>{t(lang, 'sidebar_title')}</p>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        st.divider()
+
+        # Account info
+        st.markdown(
+            f"<p style='color:#a8c8b0; font-size:0.8rem; margin-bottom:0.15rem;'>"
+            f"👤 {st.session_state.username}</p>"
+            f"<p style='color:#c9a84c; font-size:0.78rem; margin-bottom:0.8rem;"
+            f" font-weight:500;'>[ {role_label} ]</p>",
+            unsafe_allow_html=True,
+        )
 
         if st.button(t(lang, "btn_new_chat"), use_container_width=True):
             st.session_state.messages        = []
             st.session_state.current_chat_id = None
+            st.session_state["_pending_cases"] = None
+            st.session_state["_show_cases"]    = False
             st.rerun()
 
         if st.button(t(lang, "btn_switch_role"), use_container_width=True):
             st.session_state.page            = "Landing"
             st.session_state.messages        = []
             st.session_state.current_chat_id = None
+            st.session_state["_pending_cases"] = None
+            st.session_state["_show_cases"]    = False
             st.rerun()
 
         if st.button(t(lang, "btn_logout"), use_container_width=True):
             for k in ["logged_in", "username", "user_role", "messages", "current_chat_id"]:
                 st.session_state[k] = defaults[k]
+            st.session_state["_pending_cases"] = None
+            st.session_state["_show_cases"]    = False
             st.session_state.page = "Login"
             st.rerun()
 
         st.divider()
-        st.markdown(f"### {t(lang, 'quick_questions_title')}")
+
+        # Quick questions
+        st.markdown(
+            f"<p style='color:#a8c8b0; font-size:0.78rem; font-weight:600;"
+            f" letter-spacing:0.4px; text-transform:uppercase; margin-bottom:0.5rem;'>"
+            f"{t(lang, 'quick_questions_title')}</p>",
+            unsafe_allow_html=True,
+        )
         for label, value in btns:
             if st.button(label, use_container_width=True):
                 st.session_state.btn_input = value
 
         st.divider()
-        st.markdown(f"### {t(lang, 'history_title')}")
+
+        # Chat history
+        st.markdown(
+            f"<p style='color:#a8c8b0; font-size:0.78rem; font-weight:600;"
+            f" letter-spacing:0.4px; text-transform:uppercase; margin-bottom:0.5rem;'>"
+            f"{t(lang, 'history_title')}</p>",
+            unsafe_allow_html=True,
+        )
         saved_chats = list_chats(st.session_state.username)
         if not saved_chats:
             st.info(t(lang, "history_empty"))
@@ -628,11 +1299,32 @@ def show_chat_room():
                     st.rerun()
 
     # --- 主聊天區 ---
-    st.title(f"⚖️ {title}")
+    st.markdown(
+        f"<div style='border-bottom:2px solid #e6dece; padding-bottom:0.6rem; margin-bottom:0.5rem;'>"
+        f"<h2 style='color:#1a3a28; font-size:1.35rem; font-weight:700; margin:0;'>"
+        f"⚖️ {title}</h2>"
+        f"<span style='color:#7a6e58; font-size:0.85rem;'>勞動基準法 AI 顧問 · 勞動部法規資料庫</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+
+    # ── 「查看相似案例」按鈕（出現在最後一則 AI 回答之後）──
+    _has_cases = bool(st.session_state.get("_pending_cases"))
+    _last_is_assistant = (
+        bool(st.session_state.messages)
+        and st.session_state.messages[-1]["role"] == "assistant"
+    )
+    if _has_cases and _last_is_assistant:
+        if not st.session_state.get("_show_cases"):
+            if st.button("🔍 查看相似案例"):
+                st.session_state["_show_cases"] = True
+                st.rerun()
+        else:
+            _render_case_results(st.session_state["_pending_cases"], lang)
 
     prompt = st.chat_input(t(lang, "chat_input_placeholder"))
     if st.session_state.btn_input:
@@ -640,14 +1332,22 @@ def show_chat_room():
         st.session_state.btn_input = None
 
     if prompt:
+        # Clear previous case results when a new question is submitted
+        st.session_state["_pending_cases"] = None
+        st.session_state["_show_cases"]    = False
+
         with st.chat_message("user"):
             st.markdown(prompt)
         st.session_state.messages.append({"role": "user", "content": prompt})
 
         with st.chat_message("assistant"):
+            # Spinner covers retrieval only; the answer then streams in
             with st.spinner(t(lang, "thinking_spinner")):
-                resp = query_rag_system(prompt, persona, lang)
+                resp = _handle_prompt(prompt, persona, lang)
+            if isinstance(resp, str):
                 st.markdown(resp)
+            else:
+                resp = st.write_stream(resp)
         st.session_state.messages.append({"role": "assistant", "content": resp})
 
         if not st.session_state.current_chat_id:
@@ -661,6 +1361,16 @@ def show_chat_room():
 # ==========================================
 # 7. 主程式 — 頁面路由
 # ==========================================
+
+# Pre-load index at startup so the spinner shows immediately instead of on first query.
+# @st.cache_resource ensures this runs only once per process lifetime.
+if VECTOR_BACKEND == "chroma":
+    if _load_chroma_index() is None:
+        st.warning("⚠️ Chroma 索引載入失敗（已嘗試重建），已自動退回 NumPy 路徑。詳情請查看終端機日誌。")
+        _load_index()
+else:
+    _load_index()
+
 inject_css()
 
 if not st.session_state.logged_in:

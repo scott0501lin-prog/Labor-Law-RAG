@@ -4,7 +4,18 @@
 # 資料庫（本地產生，不需上傳）
 *.db
 backend/law_db/
+backend/chroma_db/
 chat_histories/
+
+# 向量索引備份（本地備份，不上傳）
+backend/embeddings_v1_backup/
+
+# 向量嵌入檔（本地計算，體積大，不上傳）
+backend/embeddings/
+*.npy
+
+# 執行紀錄
+rag_timing.log
 
 # Python 快取
 __pycache__/

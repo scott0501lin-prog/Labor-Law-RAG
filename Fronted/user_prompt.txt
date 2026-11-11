@@ -1,0 +1,6 @@
+【相關法規條文】（資料庫檢索；只有這裡的內容可以引用）：
+{law_ctx}
+
+使用者問題：{user_prompt}
+
+請依系統指示，只輸出 <scope> 與 <answer> 兩個區塊。{lang_rule}{missing_note}

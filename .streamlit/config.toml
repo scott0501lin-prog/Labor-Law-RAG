@@ -1,0 +1,4 @@
+[server]
+# The file watcher walks every imported module (transformers has thousands),
+# spamming torchvision tracebacks and burning CPU. Restart the app after code edits.
+fileWatcherType = "none"

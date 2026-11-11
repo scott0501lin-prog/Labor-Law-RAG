@@ -41,7 +41,7 @@ st.set_page_config(
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(base_dir, ".env"))
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "chroma").lower()
 
@@ -607,38 +607,33 @@ from prompt_helpers import (
 import json as _json
 import re as _re
 
-# Per-read timeout (also sent as the server-side deadline); normal answers finish in < 6s
-GEMINI_TIMEOUT_MS = 15_000
 # Retry only when the stream fails before any text was shown to the user
-GEMINI_MAX_ATTEMPTS = 2
+CLAUDE_MAX_ATTEMPTS = 2
+CLAUDE_MODEL = "claude-haiku-5-5"
 
 
 @st.cache_resource
-def _get_genai_client(api_key: str):
-    """Shared Gemini client — building one per request costs ~1s (TLS / httpx setup)."""
-    from google import genai as _genai
-    from google.genai import types as _types
-    return _genai.Client(
-        api_key=api_key,
-        http_options=_types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
-    )
+def _get_anthropic_client(api_key: str):
+    """Shared Anthropic client — cached to avoid repeated TLS setup."""
+    import anthropic as _ant
+    return _ant.Anthropic(api_key=api_key)
 
 
-def _gemini_json_call(prompt_text: str, _label: str = "intent") -> dict | None:
-    """Fire a Gemini call and return parsed JSON dict, or None on any failure."""
+def _claude_json_call(prompt_text: str, _label: str = "intent") -> dict | None:
+    """Fire a Claude call and return parsed JSON dict, or None on any failure."""
     try:
-        api_key = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
+        api_key = ANTHROPIC_API_KEY or os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
             print(f"[INTENT] [{_label}] API key 未設定，略過")
             return None
-        client = _get_genai_client(api_key)
-        resp = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt_text,
+        client = _get_anthropic_client(api_key)
+        resp = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt_text}],
         )
-        text = resp.text.strip()
-        print(f"[INTENT] [{_label}] Gemini 原始回傳: {text!r}")
-        # Strip optional ```json ... ``` wrapper Gemini sometimes adds
+        text = resp.content[0].text.strip()
+        print(f"[INTENT] [{_label}] Claude 原始回傳: {text!r}")
         m = _re.search(r'\{.*\}', text, _re.DOTALL)
         if m:
             text = m.group()
@@ -663,7 +658,7 @@ def _analyze_intent(user_message: str, known_info: dict, ui_lang: str) -> dict |
         known_info_json=_json.dumps(known_info, ensure_ascii=False),
         ui_lang=ui_lang,
     )
-    result = _gemini_json_call(prompt, _label="analyze_intent")
+    result = _claude_json_call(prompt, _label="analyze_intent")
     if result:
         print(f"[INTENT]   intent       = {result.get('intent')!r}")
         print(f"[INTENT]   scenario     = {result.get('scenario')!r}")
@@ -687,7 +682,7 @@ def _extract_overtime_fields(user_message: str, known_info: dict, ui_lang: str) 
         known_info_json=_json.dumps(known_info, ensure_ascii=False),
         ui_lang=ui_lang,
     )
-    result = _gemini_json_call(prompt, _label="extract_fields")
+    result = _claude_json_call(prompt, _label="extract_fields")
     if result:
         print(f"[INTENT]   is_new_question = {result.get('is_new_question')}")
         print(f"[INTENT]   known_info      = {result.get('known_info')}")
@@ -849,14 +844,12 @@ def query_rag_system(
         NOT to assume values.
     """
     try:
-        from google.genai import types
-
-        api_key = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
+        api_key = ANTHROPIC_API_KEY or os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
             return t(ui_lang, "err_no_api_key")
 
         _t0 = time.perf_counter()
-        client = _get_genai_client(api_key)
+        client = _get_anthropic_client(api_key)
 
         _use_chroma = VECTOR_BACKEND == "chroma"
         if _use_chroma:
@@ -880,13 +873,11 @@ def query_rag_system(
             search_query = user_prompt
             if not _is_chinese(user_prompt):
                 try:
-                    search_query = client.models.generate_content(
-                        model="gemini-2.5-flash",
-                        contents=f"請將以下使用者問題翻譯成繁體中文，只需要輸出翻譯結果，不要加任何說明：\n\n{user_prompt}",
-                        config=types.GenerateContentConfig(
-                            thinking_config=types.ThinkingConfig(thinking_budget=0),
-                        ),
-                    ).text.strip()
+                    search_query = client.messages.create(
+                        model=CLAUDE_MODEL,
+                        max_tokens=256,
+                        messages=[{"role": "user", "content": f"請將以下使用者問題翻譯成繁體中文，只需要輸出翻譯結果，不要加任何說明：\n\n{user_prompt}"}],
+                    ).content[0].text.strip()
                 except Exception:
                     search_query = user_prompt
         _t_trans = time.perf_counter()
@@ -944,46 +935,41 @@ def query_rag_system(
         final_prompt = build_user_prompt(law_ctx, user_prompt, lang_rule, missing_note)
         _t_prompt = time.perf_counter()
 
-        # Disable thinking (budget=0) to reduce latency on Flash
-        _thinking_kwargs: dict = {}
-        if hasattr(types, "ThinkingConfig"):
-            _thinking_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
-
     except Exception as e:
         return f"🚨 異常：{str(e)}"
 
     _stats = {"t_first": None, "usage": None, "retries": 0}
 
     def _raw() -> Iterator[str]:
-        """Yield raw Gemini text chunks, recording first-token time and usage.
+        """Yield raw Claude text chunks, recording first-token time and usage.
 
         Retries a failed/timed-out request only if no text was yielded yet;
         once the user has seen part of the answer, the error is re-raised.
         """
-        for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+        for attempt in range(1, CLAUDE_MAX_ATTEMPTS + 1):
             emitted = False
             try:
-                for chunk in client.models.generate_content_stream(
-                    model="gemini-2.5-flash",
-                    contents=final_prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_prompt,
-                        **_thinking_kwargs,
-                    ),
-                ):
-                    if getattr(chunk, "usage_metadata", None):
-                        _stats["usage"] = chunk.usage_metadata
-                    if chunk.text:
-                        if _stats["t_first"] is None:
-                            _stats["t_first"] = time.perf_counter()
-                        emitted = True
-                        yield chunk.text
+                with client.messages.stream(
+                    model=CLAUDE_MODEL,
+                    max_tokens=2048,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": final_prompt}],
+                ) as stream:
+                    for text_chunk in stream.text_stream:
+                        if text_chunk:
+                            if _stats["t_first"] is None:
+                                _stats["t_first"] = time.perf_counter()
+                            emitted = True
+                            yield text_chunk
+                    final_msg = stream.get_final_message()
+                    if final_msg:
+                        _stats["usage"] = final_msg.usage
                 return
             except Exception as e:
-                if emitted or attempt == GEMINI_MAX_ATTEMPTS:
+                if emitted or attempt == CLAUDE_MAX_ATTEMPTS:
                     raise
                 _stats["retries"] += 1
-                print(f"[GEMINI] 第 {attempt} 次呼叫失敗，重試：{e}", flush=True)
+                print(f"[CLAUDE] 第 {attempt} 次呼叫失敗，重試：{e}", flush=True)
 
     def _stream() -> Iterator[str]:
         """Stream the <answer> body; OUT scope gets the fixed referral text instead."""
@@ -1001,13 +987,13 @@ def query_rag_system(
             yield f"\n\n🚨 回答中斷（{type(e).__name__}），請再問一次。"
             return
 
-        _t_gemini = time.perf_counter()
+        _t_claude = time.perf_counter()
         _t_first  = _stats["t_first"]
         _usage    = _stats["usage"]
 
-        # Token usage
-        _thinking_tok  = int(getattr(_usage, "thoughts_token_count",    0) or 0)
-        _output_tok    = int(getattr(_usage, "candidates_token_count",  0) or 0)
+        # Token usage (Anthropic SDK: usage.input_tokens / output_tokens)
+        _input_tok  = int(getattr(_usage, "input_tokens",  0) or 0)
+        _output_tok = int(getattr(_usage, "output_tokens", 0) or 0)
 
         _rag_logger.info(
             f"q={user_prompt[:25]!r} zh={_is_chinese(user_prompt)} "
@@ -1018,11 +1004,11 @@ def query_rag_system(
             f"case_search={_t_case_search-_t_force_l:.3f}s "
             f"force_c={_t_force_c-_t_case_search:.3f}s "
             f"prompt={_t_prompt-_t_force_c:.3f}s "
-            f"ttft={(_t_first or _t_gemini)-_t_prompt:.3f}s "
-            f"gemini={_t_gemini-_t_prompt:.3f}s "
-            f"total={_t_gemini-_t0:.3f}s "
+            f"ttft={(_t_first or _t_claude)-_t_prompt:.3f}s "
+            f"claude={_t_claude-_t_prompt:.3f}s "
+            f"total={_t_claude-_t0:.3f}s "
             f"prompt_chars={len(final_prompt)} "
-            f"thinking_tok={_thinking_tok} output_tok={_output_tok} "
+            f"input_tok={_input_tok} output_tok={_output_tok} "
             f"scope={'OUT' if is_out else 'IN'} retries={_stats['retries']}"
         )
 

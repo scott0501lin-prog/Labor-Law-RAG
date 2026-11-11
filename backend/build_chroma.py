@@ -3,7 +3,7 @@
 執行一次即可：python backend/build_chroma.py
 
 Collections（與 app.py 一致）：
-  law_chunks_bgem3   — 勞基法本法 + 施行細則（一條一塊）
+  law_chunks_bgem3   — 勞基法本法 + 施行細則 + 性別平等工作法（一條一塊）
   cases_chunks_bgem3 — 案例 / Q&A / 裁判書（約 400 字一塊）
 
 metadata 欄位可用於 ChromaDB where 過濾：
@@ -171,8 +171,10 @@ if __name__ == "__main__":
     print(f"維度：{dim} | 載入：{load_time:.1f}s | 記憶體增加：{rss1 - rss0:.0f}MB\n")
 
     # ── 法條 ──────────────────────────────────────────────────────────────────
-    print("[1/2] 勞基法本法 + 施行細則")
-    laws = load_json("labor_law_cleaned.json") + load_json("labor_law_rules_cleaned.json")
+    print("[1/2] 勞基法本法 + 施行細則 + 性別平等工作法")
+    laws = (load_json("labor_law_cleaned.json")
+            + load_json("labor_law_rules_cleaned.json")
+            + load_json("gender_equality_law.json"))
     law_texts, law_metas = build_law_chunks(laws)
     print(f"  chunk 數：{len(law_texts)}")
     t1 = time.perf_counter()

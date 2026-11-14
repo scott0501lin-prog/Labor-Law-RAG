@@ -28,7 +28,6 @@ MAX_CHUNKS_PER_DOC = 50   # 單篇文件 chunk 上限，防止超大文件（如
 
 CASE_FILES = [
     "taipei_cases.json",
-    "ntpc_cases.json",
     "mol_qa_cases.json",
     "mol_fint_cases.json",
     "judicial_cases.json",

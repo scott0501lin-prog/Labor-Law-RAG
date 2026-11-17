@@ -189,7 +189,6 @@ def crawl():
             "updated":       updated,
             "unit":          unit,
             "content":       answer,
-            "keywords":      [],
         })
         if n % 20 == 0: logger.info(f"  內文進度 {n}/{len(found)}")
     return results

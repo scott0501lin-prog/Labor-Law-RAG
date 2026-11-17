@@ -461,13 +461,17 @@ def build_record(paras, meta, date_iso):
         "brief":           brief,                  # 規則式摘要，供卡片顯示；之後可換成 LLM 摘要
         "main_text":       main_text,
         "court_reasoning": court_part,             # 本院之判斷＋結論（RAG 主要檢索內容）
-        # False＝規則沒切出法院判斷（約 4%，多為不爭執事項與判斷混寫）→ 建索引時改用 content
+        # False＝規則沒切出法院判斷（約 4%，多為不爭執事項與判斷混寫）→ 建索引時改用全文 full_text(rec)
         "reasoning_ok":    len(court_part) >= 0.1 * max(1, len(body)),
         # 不存「前言」（當事人、律師姓名）與「署名」（法官、書記官）：對檢索無用，也少存個人姓名
         "sections":        [{"section": s, "text": p} for s, p in labeled if s not in ("前言", "署名")],
-        "content":         body,                   # 全文（去掉當事人表頭與署名）
-        "keywords":        [],
     }
+    # 不另存全文 content：與 sections 重複，需要時用 full_text(rec) 由 sections 接回
+
+
+def full_text(rec):
+    """判決全文（不含當事人表頭與署名）＝ sections 依序接回。"""
+    return "\n".join(x["text"] for x in rec["sections"])
 
 
 def stage_fetch(cands=None):
@@ -489,7 +493,7 @@ def stage_fetch(cands=None):
             logger.warning(f"  [{n}] 抓取失敗：{meta['case_no']}")
             continue
         rec = parse_judgment(html, meta)
-        if not rec or len(rec["content"]) < 300:
+        if not rec or len(full_text(rec)) < 300:
             logger.warning(f"  [{n}] 內容過短或無法解析，略過：{meta['case_no']}")
             continue
         done[meta["url"]] = rec

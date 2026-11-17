@@ -56,6 +56,15 @@ LAWS = {
 
 STOP_RE = re.compile(r"停止適用|廢止|不再援用|不予援用|失其效力")
 
+# 網站掛在勞基法第 1 條下，但內容屬其他法規（人工判定），以發文字號（去空白）排除
+OUT_OF_SCOPE = {
+    "職公字第0930036388號函":         "就業促進（失業者訓用合一職前訓練計畫）",
+    "職業字第0960068026號函":         "就業促進（多元就業開發方案）",
+    "（86）台勞資二字第025286號":      "團體協約法",
+    "（77）台勞檢一字第18104號":       "勞工安全衛生法罰鍰",
+    "（90）台勞職外字第0225169號函":   "就業服務法（外勞仲介費）",
+}
+
 
 # ── 工具 ──────────────────────────────────────────
 def delay(): time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
@@ -221,6 +230,8 @@ def skip_reason(f):
     # 歷年基本工資調整公告：網站未標廢止，但金額已過時（現行依最低工資法每年公告）
     if f.get("date", "") < "2000" and re.search(r"基本工資調整為|調整後之基本工資", f.get("summary", "")):
         return "過時的基本工資調整公告"
+    if norm_doc_no(f.get("doc_no", "")) in OUT_OF_SCOPE:
+        return "範圍外：" + OUT_OF_SCOPE[norm_doc_no(f["doc_no"])]
     return ""
 
 
@@ -269,7 +280,6 @@ def main():
                 "summary":       summary,                       # 要旨（一句話）
                 "content":       f"要旨：{summary}\n{body}" if summary else body,
                 "note":          f.get("note", ""),
-                "keywords":      [],
             }
         if n % 50 == 0:
             logger.info(f"  進度 {n}/{len(todo)}：保留 {len(done)}、排除 {len(skipped)}")

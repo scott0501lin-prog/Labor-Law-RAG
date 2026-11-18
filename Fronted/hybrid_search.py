@@ -17,8 +17,8 @@ from rank_bm25 import BM25Okapi
 _DICT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "legal_dict.txt")
 
 RRF_K = int(os.getenv("RRF_K", "60"))
-# 0.3 was best on both eval sets (台北 FAQ 73% / manual 96% Hit@5 vs 70% / 96%
-# at 1.0); see eval/eval_retrieval.py. The 台北 differences are 2–4 questions.
+# 0.3 was best on the 台北 FAQ test set (Hit@5 73% vs 70% at 1.0, 71% at 0);
+# see eval/eval_retrieval.py. The differences are 2–4 of 93 questions.
 BM25_WEIGHT = float(os.getenv("RRF_BM25_WEIGHT", "0.3"))
 
 # ── Law-name aliases (applied to both documents and queries) ─────────────────

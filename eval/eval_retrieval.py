@@ -1,8 +1,7 @@
 """
 Law-retrieval evaluation: before vs. after the review revision.
 
-    python eval/eval_retrieval.py                 # both test sets
-    python eval/eval_retrieval.py --set taipei    # 台北市常見問答 only
+    python eval/eval_retrieval.py
 
 Systems compared (top-5 law documents per query):
   before   text2vec-base-chinese, vector only, old index (law_embeddings.npy,
@@ -10,15 +9,14 @@ Systems compared (top-5 law documents per query):
   vector   bge-m3, vector only, new index from backend/build_index.py
   hybrid   bge-m3 + jieba BM25 fused by RRF (what the app runs)
 
-Test sets:
-  taipei   eval/taipei_faq_testset.json (citations from 台北市勞動局常見問答)
-  manual   hand-written queries below (explicit article numbers + colloquial)
+Test set: eval/taipei_faq_testset.json — questions from 台北市勞動局常見問答
+(collected in backend/scraper2), expected articles = the statutes each
+official answer cites (see eval/build_taipei_testset.py).
 
 Metrics: Hit@5 (any expected article in top 5), Recall@5 (share of expected
 articles found). "core" restricts to items whose expected articles are all
 勞基法 / 施行細則, the only laws the old index covered.
 """
-import argparse
 import json
 import os
 import sys
@@ -33,33 +31,6 @@ EMB = os.path.join(ROOT, "backend", "embeddings")
 LAB, RUL = "勞動基準法", "勞動基準法施行細則"
 K = 5
 
-MANUAL = [
-    ("勞基法第24條加班費怎麼算", [(LAB, "第 24 條")]),
-    ("第三十二條之一補休規定", [(LAB, "第 32-1 條")]),
-    ("勞基法 9-1 條競業禁止要件", [(LAB, "第 9-1 條")]),
-    ("第38條特休天數", [(LAB, "第 38 條")]),
-    ("勞基法第十一條資遣事由", [(LAB, "第 11 條")]),
-    ("第12條不經預告終止契約", [(LAB, "第 12 條")]),
-    ("施行細則第7條勞動契約應約定事項", [(RUL, "第 7 條")]),
-    ("勞基法施行細則第24條之1特休", [(RUL, "第 24-1 條")]),
-    ("勞基法第84條之1責任制", [(LAB, "第 84-1 條")]),
-    ("第五十九條職災補償", [(LAB, "第 59 條")]),
-    ("未休特休可以換錢嗎", [(LAB, "第 38 條")]),
-    ("公司要資遣我，資遣費怎麼算", [(LAB, "第 17 條")]),
-    ("預告期間多久", [(LAB, "第 16 條")]),
-    ("謀職假可以請幾天", [(LAB, "第 16 條")]),
-    ("平均工資的定義", [(LAB, "第 2 條")]),
-    ("休息日加班費", [(LAB, "第 24 條")]),
-    ("例假日可以叫員工上班嗎", [(LAB, "第 36 條"), (LAB, "第 40 條")]),
-    ("國定假日出勤工資加倍", [(LAB, "第 39 條")]),
-    ("工作滿幾年可以自請退休", [(LAB, "第 53 條")]),
-    ("強制退休年齡", [(LAB, "第 54 條")]),
-    ("派遣勞工被要派單位欠薪", [(LAB, "第 22-1 條")]),
-    ("童工工作時間限制", [(LAB, "第 47 條")]),
-    ("女性夜間工作", [(LAB, "第 49 條")]),
-    ("工資清冊保存幾年", [(LAB, "第 23 條")]),
-    ("最低服務年限約定", [(LAB, "第 15-1 條")]),
-]
 
 
 def load_taipei():
@@ -94,15 +65,10 @@ def score(results, expected):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--set", choices=["taipei", "manual"])
-    args = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
     from sentence_transformers import SentenceTransformer
 
-    sets = {"taipei": load_taipei(), "manual": MANUAL}
-    if args.set:
-        sets = {args.set: sets[args.set]}
+    sets = {"taipei": load_taipei()}
 
     old_emb, _, old_metas = load_index("")
     new_emb, new_texts, new_metas = load_index("_bgem3")

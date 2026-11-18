@@ -87,13 +87,15 @@ streamlit run Fronted/app.py
 │   ├── db.py           # MongoDB 資料層（帳號、對話紀錄）
 │   ├── i18n.py         # 多語系介面文字
 │   ├── force_rules.py  # 關鍵字強制帶入條文規則
-│   └── intent_config.py # 意圖判斷與追問設定
+│   ├── intent_config.py # 意圖判斷與追問設定
+│   ├── intent_router.py # 依意圖決定檢索範圍與回答格式
+│   └── hybrid_search.py # jieba BM25 + 向量檢索，以 RRF 合併
 ├── backend/
-│   ├── build_index.py  # 預計算 embedding 並儲存為 .npy
+│   ├── build_index.py  # 離線切塊並以 bge-m3 編碼，輸出至 embeddings/
 │   ├── embeddings/     # 預計算的向量索引（.npy + .json）
-│   ├── data/           # 法條與案例原始資料（*.json）
-│   └── scrapers/       # 爬蟲腳本（輸出至 backend/data/）
-├── eval/               # 測試與評估腳本（檢索比較、計時、強制帶入規則測試）
+│   ├── scraper2/       # 爬蟲（spiders/）與法規、問答、函釋、判決資料（data/）
+│   └── data/           # 手動整理的補充資料
+├── eval/               # 測試與評估腳本（檢索命中率、計時、強制帶入規則測試）
 ├── requirements.txt
 └── .env                # 機密設定（不上傳 GitHub）
 ```

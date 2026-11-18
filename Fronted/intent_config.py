@@ -6,9 +6,11 @@ without touching app.py.
 import os
 
 # ── Feature toggle ────────────────────────────────────────────────────────────
-# Disabled by default to save one Gemini round-trip per question.
-# Set INTENT_DETECTION=true in .env or Streamlit Secrets to re-enable.
-ENABLE_INTENT_DETECTION = os.getenv("INTENT_DETECTION", "false").lower() == "true"
+# On by default: the intent decides which corpora are searched and which
+# answer format is used (see intent_router.py). The same call also does the
+# translation, so non-Chinese questions need no extra round-trip.
+# Set INTENT_DETECTION=false to fall back to keyword heuristics.
+ENABLE_INTENT_DETECTION = os.getenv("INTENT_DETECTION", "true").lower() == "true"
 
 # ── Follow-up limits ──────────────────────────────────────────────────────────
 MAX_FOLLOWUP_ROUNDS = 2
@@ -56,6 +58,7 @@ INTENT_ANALYSIS_PROMPT = """\
 {{
   "translated_query": "若原文非繁體中文請翻譯，否則原樣輸出",
   "intent": "solve_problem 或 find_cases 或 law_lookup 或 out_of_scope",
+  "laws": ["相關法規，依關聯度排序，只能從：勞動基準法、勞動基準法施行細則、性別平等工作法"],
   "scenario": "overtime_pay 或 other",
   "known_info": {{
     "day_type": "平日 或 休息日 或 例假日 或 國定假日 或 null",
@@ -69,8 +72,14 @@ INTENT_ANALYSIS_PROMPT = """\
 }}
 
 ## 說明
-- intent 定義：solve_problem = 有具體勞動問題要解決；find_cases = 想找判決案例；
-  law_lookup = 查法條內容；out_of_scope = 與勞動法無關
+- intent 定義：
+  - solve_problem：描述自己的處境，想知道權益或怎麼處理（勞資爭議諮詢）
+  - find_cases：想看案例、判決、函釋、裁罰或實際處理情形（例：「雙北性別平等案例」「資遣的判決」）
+  - law_lookup：想知道某條法條或某項制度的規定內容（例：「勞基法第 30 條」「特休怎麼規定」）
+  - out_of_scope：與勞動、職場無關，或明確只涉及勞工保險、勞工退休金條例、民法、刑法、稅法、公司法
+  - 不確定時選 solve_problem，不要選 out_of_scope
+- laws：性騷擾、性別歧視、產假、陪產、育嬰、生理假、哺乳、家庭照顧等主題把「性別平等工作法」排第一；
+  一般勞動條件把「勞動基準法」排第一；問施行細則才把施行細則排第一。out_of_scope 時給空陣列
 - scenario overtime_pay：問題涉及加班費計算或補休換算
 - known_info：從訊息中提取已知值，未知設 null
 - missing_fields 必填欄位：day_type、hours、wage_amount（compensation_type 不追問）

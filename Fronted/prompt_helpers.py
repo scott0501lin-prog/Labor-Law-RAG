@@ -24,7 +24,7 @@ ROLE_DESC = {
 
 # 超出範圍時給使用者看的固定文字（不由模型生成）
 OUT_OF_SCOPE_TEXT = (
-    "此問題不在本系統目前的資料範圍內（勞動基準法與施行細則）。\n\n"
+    "此問題不在本系統目前的資料範圍內（勞動基準法、施行細則、性別平等工作法及相關案例）。\n\n"
     "建議洽詢：\n"
     "- 律師\n"
     "- 法律扶助基金會\n"
@@ -54,10 +54,36 @@ def build_missing_note(labels: str) -> str:
     )
 
 
-def build_user_prompt(law_ctx: str, user_prompt: str, lang_rule: str = "", missing_note: str = "") -> str:
+MODE_NAMES = {"consult": "諮詢", "cases": "案例", "law": "法條"}
+
+_CASE_CHARS = 450  # per-case excerpt length in the prompt
+
+
+def build_case_ctx(cases: list) -> str:
+    """Format [(text, meta, score)] case results as a prompt section ('' if none)."""
+    if not cases:
+        return ""
+    parts = []
+    for n, (text, meta, _) in enumerate(cases, 1):
+        title = meta.get("title") or ""
+        src = " ".join(x for x in (meta.get("source"), meta.get("category")) if x)
+        body = meta.get("display_text", text)
+        if len(body) > _CASE_CHARS:
+            body = body[:_CASE_CHARS] + "…"
+        parts.append(f"【案例 {n}】{title}（{src}）\n{body}")
+    return (
+        "\n【參考案例】（資料庫檢索；只能當實務參考，不能當作法條依據）：\n"
+        + "\n\n".join(parts) + "\n"
+    )
+
+
+def build_user_prompt(law_ctx: str, user_prompt: str, lang_rule: str = "", missing_note: str = "",
+                      case_ctx: str = "", mode: str = "consult") -> str:
     return USER_TEMPLATE.format(
-        law_ctx=law_ctx,
+        law_ctx=law_ctx or "（沒有檢索到相關條文）",
+        case_ctx=case_ctx,
         user_prompt=user_prompt,
+        mode_name=MODE_NAMES.get(mode, MODE_NAMES["consult"]),
         lang_rule=lang_rule,
         missing_note=missing_note,
     )

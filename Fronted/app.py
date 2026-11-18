@@ -622,22 +622,30 @@ def _load_bm25(kind: str, backend: str, _texts: list, _metas: list):
     return idx
 
 
-def _retrieve(vector_fn, kind: str, backend: str, query: str, texts: list, metas: list, top_k: int = 5):
+def _retrieve(vector_fn, kind: str, backend: str, query: str, texts: list, metas: list,
+              top_k: int = 5, allow=None):
     """Vector search, optionally fused with BM25 via RRF.
 
     vector_fn(top_k, top_k_chunks) -> [(text, meta, score)]
+    allow(meta) -> bool restricts results (e.g. to the laws the intent names).
     """
+    pool = 30
+
+    def _vector_only():
+        if allow is None:
+            return vector_fn(top_k, 20)
+        return [r for r in vector_fn(pool, pool) if allow(r[1])][:top_k]
+
     if not HYBRID_SEARCH:
-        return vector_fn(top_k, 20)
+        return _vector_only()
     try:
         from hybrid_search import rrf_merge
-        pool = 30
         vec = vector_fn(pool, pool)
         bm25_idx = _load_bm25(kind, backend, texts, metas).search(query, top_n=pool)
-        return rrf_merge(vec, bm25_idx, texts, metas, top_k=top_k, query=query)
+        return rrf_merge(vec, bm25_idx, texts, metas, top_k=top_k, query=query, allow=allow)
     except Exception as e:  # keyword layer must never break answering
         print(f"[BM25] fallback to vector-only: {e}", flush=True)
-        return vector_fn(top_k, 20)
+        return _vector_only()
 
 
 # Force-include rules, constants, and helper functions live in force_rules.py
@@ -657,8 +665,10 @@ from prompt_helpers import (
     build_lang_rule,
     build_missing_note,
     build_user_prompt,
+    build_case_ctx,
     stream_reply,
 )
+from intent_router import make_plan, heuristic_intent, detect_laws, INTENTS
 
 
 # ==========================================
@@ -679,6 +689,17 @@ def _get_anthropic_client(api_key: str):
     return _ant.Anthropic(api_key=api_key)
 
 
+# Haiku 5.5 thinks by default, so content[0] may be a ThinkingBlock — only
+# text blocks carry the answer.
+def _response_text(resp) -> str:
+    return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+
+# Short utility calls (intent JSON, translation) don't benefit from thinking;
+# turning it off keeps them fast. Allowed on Haiku 5.5 at effort high or below.
+_NO_THINKING = {"type": "disabled"}
+
+
 def _claude_json_call(prompt_text: str, _label: str = "intent") -> dict | None:
     """Fire a Claude call and return parsed JSON dict, or None on any failure."""
     try:
@@ -689,10 +710,11 @@ def _claude_json_call(prompt_text: str, _label: str = "intent") -> dict | None:
         client = _get_anthropic_client(api_key)
         resp = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=512,
+            max_tokens=1024,
+            thinking=_NO_THINKING,
             messages=[{"role": "user", "content": prompt_text}],
         )
-        text = resp.content[0].text.strip()
+        text = _response_text(resp)
         print(f"[INTENT] [{_label}] Claude 原始回傳: {text!r}")
         m = _re.search(r'\{.*\}', text, _re.DOTALL)
         if m:
@@ -807,14 +829,20 @@ def _handle_prompt(prompt: str, persona: str, lang: str) -> str | Iterator[str]:
             st.session_state.followup_count = 0
             return analysis.get("follow_up") or ""
         else:
-            reason = "解析失敗" if not analysis else f"intent={analysis.get('intent')!r} scenario={analysis.get('scenario')!r}"
-            print(f"[INTENT] 分支: 直接 RAG | {reason}")
             sq = analysis.get("translated_query") if analysis else None
-            return query_rag_system(qprompt, persona, lang, search_query_override=sq)
+            if analysis and analysis.get("intent") in INTENTS:
+                intent, laws = analysis["intent"], analysis.get("laws") or detect_laws(sq or qprompt)
+            else:  # LLM call / JSON failed → keyword fallback
+                intent, laws = heuristic_intent(sq or qprompt), detect_laws(sq or qprompt)
+            print(f"[INTENT] 分支: 直接 RAG | intent={intent!r} laws={laws} "
+                  f"scenario={(analysis or {}).get('scenario')!r}")
+            return query_rag_system(qprompt, persona, lang, search_query_override=sq,
+                                    intent=intent, laws=laws)
 
     if not ENABLE_INTENT_DETECTION:
-        print("[INTENT] 未執行: 功能關閉 (ENABLE_INTENT_DETECTION=False) → 直接 RAG")
-        return query_rag_system(prompt, persona, lang)
+        intent, laws = heuristic_intent(prompt), detect_laws(prompt)
+        print(f"[INTENT] 功能關閉 → 關鍵字分類 intent={intent!r} laws={laws}")
+        return query_rag_system(prompt, persona, lang, intent=intent, laws=laws)
 
     ctx = st.session_state.intent_ctx
     print(f"[INTENT] intent_ctx = {'有進行中對話' if ctx else '無 (新問題)'}")
@@ -892,10 +920,17 @@ def query_rag_system(
     *,
     search_query_override: str | None = None,
     missing_fields: list[str] | None = None,
+    intent: str = "solve_problem",
+    laws: list[str] | None = None,
 ) -> str | Iterator[str]:
     """Run retrieval eagerly, then return a generator that streams the answer.
 
-    Returns a plain string for early errors (missing API key, retrieval failure).
+    Returns a plain string for early errors (missing API key, retrieval failure)
+    and for out-of-scope questions (fixed referral text, no retrieval/LLM).
+
+    intent / laws: from _analyze_intent (or keyword fallback); they pick the
+        corpora, result counts, whether cases enter the prompt, and the answer
+        format — see intent_router.make_plan.
 
     search_query_override: pre-translated Chinese query from _analyze_intent;
         if provided, the internal translation call is skipped.
@@ -903,6 +938,12 @@ def query_rag_system(
         if non-empty, a disclaimer is appended to final_prompt asking Gemini
         NOT to assume values.
     """
+    plan = make_plan(intent, laws)
+    if plan is None:
+        _rag_logger.info(f"q={user_prompt[:25]!r} intent=out_of_scope → fixed referral, no retrieval")
+        st.session_state["_pending_cases"] = None
+        return OUT_OF_SCOPE_TEXT
+
     try:
         api_key = ANTHROPIC_API_KEY or os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
@@ -933,11 +974,12 @@ def query_rag_system(
             search_query = user_prompt
             if not _is_chinese(user_prompt):
                 try:
-                    search_query = client.messages.create(
+                    search_query = _response_text(client.messages.create(
                         model=CLAUDE_MODEL,
-                        max_tokens=256,
+                        max_tokens=512,
+                        thinking=_NO_THINKING,
                         messages=[{"role": "user", "content": f"請將以下使用者問題翻譯成繁體中文，只需要輸出翻譯結果，不要加任何說明：\n\n{user_prompt}"}],
-                    ).content[0].text.strip()
+                    )) or user_prompt
                 except Exception:
                     search_query = user_prompt
         _t_trans = time.perf_counter()
@@ -947,11 +989,13 @@ def query_rag_system(
             _law_vec = lambda k, kc: _chroma_search(model, law_col, search_query, top_k=k, _top_k_chunks=kc)
         else:
             _law_vec = lambda k, kc: _search(model, search_query, law_emb, law_texts, law_metas, top_k=k, _top_k_chunks=kc)
-        l_results = _retrieve(_law_vec, "law", _backend, search_query, law_texts, law_metas, top_k=5)
+        _allowed_laws = set(plan.laws)
+        l_results = _retrieve(_law_vec, "law", _backend, search_query, law_texts, law_metas,
+                              top_k=plan.law_k, allow=lambda m: m.get("source") in _allowed_laws)
         _t_law_search = time.perf_counter()
 
         fired_mutex: set = set()
-        for rule in FORCE_ARTICLE_RULES:
+        for rule in (FORCE_ARTICLE_RULES if plan.force_rules else []):
             if rule["mutex"] and rule["mutex"] in fired_mutex:
                 continue
             if any(k in search_query for k in rule["keywords"]):
@@ -968,7 +1012,8 @@ def query_rag_system(
             _case_vec = lambda k, kc: _chroma_search(model, cases_col, search_query, top_k=k, _top_k_chunks=kc)
         else:
             _case_vec = lambda k, kc: _search(model, search_query, case_emb, case_texts, case_metas, top_k=k, _top_k_chunks=kc)
-        c_results = _retrieve(_case_vec, "cases", _backend, search_query, case_texts, case_metas, top_k=5)
+        c_results = _retrieve(_case_vec, "cases", _backend, search_query, case_texts, case_metas,
+                              top_k=plan.case_k)
         _t_case_search = time.perf_counter()
 
         _overtime_kw = next(r["keywords"] for r in FORCE_ARTICLE_RULES if r["name"] == "加班延長工時")
@@ -982,8 +1027,9 @@ def query_rag_system(
             display = m.get("display_text", d)
             law_ctx += f"【法規內容】：{display}\n【條號】：{m.get('source', '')} {m.get('article_no', '')}\n\n"
 
-        # c_results are saved to session_state for the "查看相似案例" button;
-        # they are NOT included in the Gemini prompt (saves tokens).
+        # Cases go into the prompt per the plan (find_cases: all 5, consult: top 2,
+        # law lookup: none); the full list is also kept for the "查看相似案例" button.
+        case_ctx = build_case_ctx(c_results[:plan.cases_in_prompt])
         st.session_state["_pending_cases"] = c_results
         st.session_state["_show_cases"]    = False
 
@@ -995,7 +1041,8 @@ def query_rag_system(
         labels = "、".join(MISSING_FIELDS_LABELS.get(f, f) for f in (missing_fields or []))
         missing_note = build_missing_note(labels)
 
-        final_prompt = build_user_prompt(law_ctx, user_prompt, lang_rule, missing_note)
+        final_prompt = build_user_prompt(law_ctx, user_prompt, lang_rule, missing_note,
+                                         case_ctx=case_ctx, mode=plan.mode)
         _t_prompt = time.perf_counter()
 
     except Exception as e:
@@ -1072,7 +1119,8 @@ def query_rag_system(
             f"total={_t_claude-_t0:.3f}s "
             f"prompt_chars={len(final_prompt)} "
             f"input_tok={_input_tok} output_tok={_output_tok} "
-            f"scope={'OUT' if is_out else 'IN'} retries={_stats['retries']}"
+            f"scope={'OUT' if is_out else 'IN'} retries={_stats['retries']} "
+            f"intent={plan.intent} laws={','.join(plan.laws)}"
         )
 
         # OUT_OF_SCOPE_TEXT already lists referral channels

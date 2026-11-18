@@ -192,6 +192,7 @@ def rrf_merge(
     top_k: int = 5,
     k: int = RRF_K,
     query: str | None = None,
+    allow=None,
 ) -> list[tuple]:
     """Fuse vector results [(text, meta, score)] and BM25 chunk indices.
 
@@ -200,10 +201,12 @@ def rrf_merge(
     article number, docs with that exact article_no get a third, rank-1
     vote (two votes when the cited law also matches) — an explicit citation
     is the strongest signal we have. Returns [(text, meta, rrf_score)] in
-    the same shape as the vector searchers.
+    the same shape as the vector searchers. *allow(meta) -> bool*, if given,
+    drops docs before ranking (e.g. restrict to the laws the intent names).
     """
     fused: dict[str, float] = {}
     payload: dict[str, tuple] = {}
+    ok = allow or (lambda _m: True)
 
     if query:
         arts, law = query_articles(query)
@@ -213,7 +216,7 @@ def rrf_merge(
                     if m.get("article_no") else None
                 if tok not in arts:
                     continue
-                if law and m.get("source") != law:
+                if (law and m.get("source") != law) or not ok(m):
                     continue
                 key = doc_key(m, str(i))
                 if key in payload:
@@ -225,7 +228,7 @@ def rrf_merge(
     rank = 0
     for text, meta, _ in vec_results:
         key = doc_key(meta)
-        if key in seen:
+        if key in seen or not ok(meta):
             continue
         seen.add(key)
         rank += 1
@@ -236,7 +239,7 @@ def rrf_merge(
     rank = 0
     for i in bm25_idx:
         key = doc_key(metas[i], str(i))
-        if key in seen:
+        if key in seen or not ok(metas[i]):
             continue
         seen.add(key)
         rank += 1

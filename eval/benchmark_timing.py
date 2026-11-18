@@ -1,6 +1,6 @@
 """
 分段計時 benchmark — 不依賴 Streamlit
-執行：python benchmark_timing.py
+執行：python eval/benchmark_timing.py
 """
 
 import os
@@ -10,7 +10,7 @@ import json
 import numpy as np
 from dotenv import load_dotenv
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 EMB_DIR = os.path.join(BASE_DIR, "backend", "embeddings")

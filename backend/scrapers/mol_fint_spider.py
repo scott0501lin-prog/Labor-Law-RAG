@@ -9,11 +9,13 @@
 
 安裝：pip install playwright beautifulsoup4
       python -m playwright install chromium
-執行：python mol_fint_spider.py
+執行：python backend/scrapers/mol_fint_spider.py
 輸出：mol_fint_cases.json
 """
 
 import re, json, time, random, logging, urllib3
+import os
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")  # backend/data
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
@@ -270,7 +272,7 @@ def crawl_fint(page, fps):
 
 def main():
     from playwright.sync_api import sync_playwright
-    fps = load_fps("labor_law_cleaned.json")
+    fps = load_fps(os.path.join(DATA_DIR, "labor_law_cleaned.json"))
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -290,7 +292,7 @@ def main():
         results = crawl_fint(pw_page, fps)
         browser.close()
 
-    output = "mol_fint_cases.json"
+    output = os.path.join(DATA_DIR, "mol_fint_cases.json")
     with open(output, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     logger.info(f"\n✅ 完成！共 {len(results)} 筆 → {output}")

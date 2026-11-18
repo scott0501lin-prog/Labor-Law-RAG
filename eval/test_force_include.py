@@ -3,7 +3,7 @@
 不需要啟動 embedding model 或 Streamlit，純字串比對。
 
 執行：
-    python backend/test_force_include.py
+    python eval/test_force_include.py
 """
 
 import io
@@ -70,7 +70,7 @@ FORCE_ARTICLE_RULES = [
 MAX_FORCED_LAW_RESULTS = 15
 
 # ── 讀取資料庫中實際存在的條號 ──────────────────────────────────────────
-docs_path = os.path.join(os.path.dirname(__file__), "embeddings", "law_docs.json")
+docs_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend", "embeddings", "law_docs.json")
 with open(docs_path, encoding="utf-8") as f:
     law_docs = json.load(f)
 # law_docs.json 格式：{"texts": [...], "metas": [...]}

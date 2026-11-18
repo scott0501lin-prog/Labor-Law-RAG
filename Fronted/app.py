@@ -512,7 +512,7 @@ def _load_chroma_index():
 
         case_texts, case_metas = [], []
         for fn in ["taipei_cases.json", "mol_qa_cases.json", "mol_fint_cases.json",
-                   "judicial_cases.json", "ntpc_cases.json", "derived_interpretations.json"]:
+                   "judicial_cases.json", "derived_interpretations.json"]:
             for doc_idx, item in enumerate(_jload(fn)):
                 content = item.get("content", "").strip()
                 if not content:

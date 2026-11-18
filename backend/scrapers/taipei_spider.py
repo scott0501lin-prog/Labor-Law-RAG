@@ -4,11 +4,13 @@
 翻頁：ASP.NET __doPostBack POST 同一 URL
 SSL ：verify=False（憑證缺陷）
 
-執行：python taipei_spider.py
+執行：python backend/scrapers/taipei_spider.py
 輸出：taipei_cases.json
 """
 
 import re, json, time, random, logging
+import os
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")  # backend/data
 from urllib.parse import urljoin
 
 import requests, urllib3
@@ -214,7 +216,7 @@ def crawl():
 
 def main():
     data = crawl()
-    with open("taipei_cases.json", "w", encoding="utf-8") as f:
+    with open(os.path.join(DATA_DIR, "taipei_cases.json"), "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     logger.info(f"✅ 已存至 taipei_cases.json")
 

@@ -50,7 +50,6 @@ LABEL_MAX            = 15
 
 CASE_FILES = [
     "taipei_cases.json",
-    "ntpc_cases.json",
     "mol_qa_cases.json",
     "mol_fint_cases.json",
     "judicial_cases.json",

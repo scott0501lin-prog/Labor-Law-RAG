@@ -17,15 +17,18 @@ from rank_bm25 import BM25Okapi
 _DICT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "legal_dict.txt")
 
 RRF_K = int(os.getenv("RRF_K", "60"))
+# 0.3 was best on both eval sets (台北 FAQ 73% / manual 96% Hit@5 vs 70% / 96%
+# at 1.0); see eval/eval_retrieval.py. The 台北 differences are 2–4 questions.
+BM25_WEIGHT = float(os.getenv("RRF_BM25_WEIGHT", "0.3"))
 
 # ── Law-name aliases (applied to both documents and queries) ─────────────────
 # Longest first so "勞基法施行細則" is replaced before "勞基法".
 _LAW_ALIASES = [
     ("勞基法施行細則", "勞動基準法施行細則"),
     ("勞基細則", "勞動基準法施行細則"),
-    ("性別工作平等法", "性別平等工作法"),
-    ("性工法", "性別平等工作法"),
-    ("性平法", "性別平等工作法"),
+    ("勞退條例", "勞工退休金條例"),
+    ("職災保險法", "勞工職業災害保險及保護法"),
+    ("災保法", "勞工職業災害保險及保護法"),
     ("勞基法", "勞動基準法"),
 ]
 
@@ -108,13 +111,15 @@ _SYNONYMS = {
     "職災": ["職業災害"], "工傷": ["職業災害"],
     "解雇": ["解僱"], "開除": ["解僱", "終止契約"], "被裁員": ["資遣"], "裁員": ["資遣"],
     "欠薪": ["積欠工資"], "薪水": ["工資"], "薪資": ["工資"], "月薪": ["工資"],
-    "國假": ["國定假日"], "產檢假": ["陪產檢假"], "勞退": ["勞工退休金"],
+    "國假": ["國定假日"], "勞退": ["勞工退休金"],
     "試用": ["試用期"], "例假日": ["例假"],
     # statute uses older wording
     "女性": ["女工"], "女生": ["女工"], "夜間工作": ["午後十時"], "夜班": ["午後十時"],
 }
 
-_LAW_NAMES = ["勞動基準法施行細則", "勞動基準法", "性別平等工作法"]
+# Longest first so "勞動基準法施行細則" wins over "勞動基準法".
+_LAW_NAMES = ["勞工職業災害保險及保護法", "勞動基準法施行細則", "勞工退休金條例",
+              "勞工請假規則", "最低工資法", "勞動基準法"]
 
 
 def query_articles(query: str) -> tuple[set[str], str | None]:
@@ -193,6 +198,7 @@ def rrf_merge(
     k: int = RRF_K,
     query: str | None = None,
     allow=None,
+    bm25_weight: float | None = None,
 ) -> list[tuple]:
     """Fuse vector results [(text, meta, score)] and BM25 chunk indices.
 
@@ -203,10 +209,15 @@ def rrf_merge(
     is the strongest signal we have. Returns [(text, meta, rrf_score)] in
     the same shape as the vector searchers. *allow(meta) -> bool*, if given,
     drops docs before ranking (e.g. restrict to the laws the intent names).
+
+    BM25 votes are scaled by *bm25_weight* (< 1): on long natural-language
+    questions BM25 is noisy, and at full weight a document ranked mid-list by
+    both searchers outranks the vector search's rank-1 hit.
     """
     fused: dict[str, float] = {}
     payload: dict[str, tuple] = {}
     ok = allow or (lambda _m: True)
+    w_bm25 = BM25_WEIGHT if bm25_weight is None else bm25_weight
 
     if query:
         arts, law = query_articles(query)
@@ -243,7 +254,7 @@ def rrf_merge(
             continue
         seen.add(key)
         rank += 1
-        fused[key] = fused.get(key, 0.0) + 1.0 / (k + rank)
+        fused[key] = fused.get(key, 0.0) + w_bm25 / (k + rank)
         payload.setdefault(key, (texts[i], metas[i]))  # prefer vector's chunk
 
     ranked = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)[:top_k]

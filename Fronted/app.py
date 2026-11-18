@@ -369,201 +369,110 @@ def render_language_switcher():
 # ==========================================
 # 3. Numpy 向量索引（@st.cache_resource 只載入一次）
 # ==========================================
-@st.cache_resource(show_spinner="正在載入索引...")
-def _load_index():
+@st.cache_resource(show_spinner="正在載入模型與索引…")
+def _load_artifacts():
+    """Model + precomputed vectors from backend/build_index.py (loaded once).
+
+    Nothing is encoded at startup: vectors are built offline, so a cold
+    start only loads the model and two .npy files.
+    Returns dict(model, law/cases → (emb float32, texts, metas, version)).
+    """
     import json
-    import time
     import numpy as np
     from sentence_transformers import SentenceTransformer
 
     emb_dir = os.path.join(base_dir, "backend", "embeddings")
 
+    def _load(prefix):
+        npy_path = os.path.join(emb_dir, f"{prefix}_embeddings{_MODEL_SUFFIX}.npy")
+        doc_path = os.path.join(emb_dir, f"{prefix}_docs{_MODEL_SUFFIX}.json")
+        if not (os.path.exists(npy_path) and os.path.exists(doc_path)):
+            raise FileNotFoundError(f"索引檔不存在：{npy_path}\n請先執行：python backend/build_index.py")
+        emb = np.load(npy_path).astype(np.float32)   # stored as float16
+        with open(doc_path, encoding="utf-8") as f:
+            data = json.load(f)
+        if len(emb) != len(data["texts"]):
+            raise ValueError(f"{prefix}: 向量數 {len(emb)} 與文字數 {len(data['texts'])} 不符，請重跑 build_index.py")
+        return emb, data["texts"], data["metas"], data.get("corpus_version", str(len(emb)))
+
     t0 = time.perf_counter()
     model = SentenceTransformer(_MODEL_NAME)
     load_time = time.perf_counter() - t0
+    out = {"model": model, "law": _load("law"), "cases": _load("cases")}
+    print(f"[MODEL] {_MODEL_NAME} load={load_time:.1f}s | "
+          f"[INDEX] law={len(out['law'][1])} cases={len(out['cases'][1])}", flush=True)
+    return out
 
-    def _load(prefix):
-        npy_path = os.path.join(emb_dir, f"{prefix}_embeddings{_MODEL_SUFFIX}.npy")
-        if not os.path.exists(npy_path):
-            raise FileNotFoundError(
-                f"索引檔不存在：{npy_path}\n"
-                f"請先執行：python backend/build_index.py\n"
-                f"或設定 EMBED_MODEL=text2vec 使用現有索引"
-            )
-        emb  = np.load(npy_path)
-        with open(os.path.join(emb_dir, f"{prefix}_docs{_MODEL_SUFFIX}.json"), encoding="utf-8") as f:
-            data = json.load(f)
-        return emb, data["texts"], data["metas"]
 
-    law_emb,  law_texts,  law_metas  = _load("law")
-    case_emb, case_texts, case_metas = _load("cases")
-
-    dim = law_emb.shape[1]
-    try:
-        import psutil as _ps
-        rss = _ps.Process().memory_info().rss / 1024 ** 2
-        t_enc = time.perf_counter()
-        model.encode(["test"], normalize_embeddings=True)
-        enc_ms = (time.perf_counter() - t_enc) * 1000
-        print(f"[MODEL] {_MODEL_NAME} | dim={dim} | load={load_time:.1f}s | RSS={rss:.0f}MB | encode={enc_ms:.0f}ms", flush=True)
-    except ImportError:
-        print(f"[MODEL] {_MODEL_NAME} | dim={dim} | load={load_time:.1f}s", flush=True)
-    print(f"[INDEX] law={len(law_texts)} cases={len(case_texts)} total={len(law_texts)+len(case_texts)}", flush=True)
-
-    return model, law_emb, law_texts, law_metas, case_emb, case_texts, case_metas
+@st.cache_resource(show_spinner="正在載入索引...")
+def _load_index():
+    a = _load_artifacts()
+    (law_emb, law_texts, law_metas, _), (case_emb, case_texts, case_metas, _) = a["law"], a["cases"]
+    return a["model"], law_emb, law_texts, law_metas, case_emb, case_texts, case_metas
 
 
 # ── ChromaDB helpers ───────────────────────────────────────────────────────
 
 def _sanitize_meta(embed_text: str, meta: dict) -> dict:
-    """Return a Chroma-compatible metadata dict (no None values)."""
-    return {
-        "embed_text": embed_text,
-        "article_no": meta.get("article_no") or "",
-        "source":     meta.get("source") or "",
-        "parent_id":  meta.get("parent_id") or "",
-        "chunk_idx":  int(meta.get("chunk_idx") or 0),
-        "category":   meta.get("category") or "",
-        "title":      meta.get("title") or "",
-        "url":        meta.get("url") or "",
-    }
+    """Chroma metadata accepts only str/int/float/bool: drop None, join lists.
+    display_text is stored as the Chroma document instead."""
+    out = {"embed_text": embed_text}
+    for k, v in meta.items():
+        if k == "display_text" or v is None:
+            continue
+        if isinstance(v, (list, tuple)):
+            v = "、".join(map(str, v))
+        out[k] = v if isinstance(v, (str, int, float, bool)) else str(v)
+    return out
 
 
-def _build_chroma_collections(client, emb_dir, law_texts, law_metas, case_texts, case_metas):
-    """Populate law_chunks + cases_chunks from existing .npy / .json. No re-encoding."""
-    import numpy as np
-
-    def _populate(prefix, col_name, texts, metas):
-        npy_path = os.path.join(emb_dir, f"{prefix}_embeddings{_MODEL_SUFFIX}.npy")
-        if not os.path.exists(npy_path):
-            raise FileNotFoundError(
-                f"索引檔不存在：{npy_path}\n"
-                f"請先執行：python backend/build_index.py"
-            )
-        emb = np.load(npy_path)
-        try:
-            client.delete_collection(col_name)
-        except Exception:
-            pass
-        col = client.create_collection(col_name, metadata={"hnsw:space": "cosine"})
-        ids       = [f"{prefix}_{i}" for i in range(len(texts))]
-        documents = [m.get("display_text", t) for t, m in zip(texts, metas)]
-        metadatas = [_sanitize_meta(t, m) for t, m in zip(texts, metas)]
-        BATCH = 1000
-        for s in range(0, len(ids), BATCH):
-            col.add(
-                ids=ids[s:s + BATCH],
-                embeddings=emb[s:s + BATCH].tolist(),
-                documents=documents[s:s + BATCH],
-                metadatas=metadatas[s:s + BATCH],
-            )
-
-    _populate("law",   _LAW_COL_NAME,   law_texts,  law_metas)
-    _populate("cases", _CASES_COL_NAME, case_texts, case_metas)
-
-
-@st.cache_resource(show_spinner="正在準備索引，首次約需 2-3 分鐘…")
-def _load_chroma_index():
-    """Load or build ChromaDB using local bge-m3 embeddings from JSON data files.
-
-    Returns (model, law_col, cases_col, law_texts, law_metas,
-             case_texts, case_metas) on success, or None to signal fallback.
-    """
-    import chromadb, json
-    from sentence_transformers import SentenceTransformer
-
-    _BGE_LAW_COL   = "law_chunks_bgem3"
-    _BGE_CASES_COL = "cases_chunks_bgem3"
-
-    def _smart_split(text, max_chars, overlap):
-        if len(text) <= max_chars:
-            return [text]
-        chunks, start = [], 0
-        while start < len(text):
-            end = min(start + max_chars, len(text))
-            if end < len(text):
-                for b in ["。", "；", "！", "？", "\n"]:
-                    pos = text.rfind(b, start + max_chars // 3, end)
-                    if pos != -1:
-                        end = pos + 1
-                        break
-            chunks.append(text[start:end])
-            if end >= len(text):
-                break
-            start = max(start + 1, end - overlap)
-        return chunks
-
-    def _load_data():
-        data_dir = os.path.join(base_dir, "backend", "data")
-        def _jload(fn):
-            path = os.path.join(data_dir, fn)
-            return json.load(open(path, encoding="utf-8")) if os.path.exists(path) else []
-
-        law_texts, law_metas = [], []
-        for fn in ["labor_law_cleaned.json", "labor_law_rules_cleaned.json", "gender_equality_law.json"]:
-            for item in _jload(fn):
-                art_no    = item.get("article_no", "")
-                parent_id = f"law_{art_no}"
-                for idx, chunk in enumerate(_smart_split(item.get("text", ""), 500, 50)[:50]):
-                    law_texts.append(chunk)
-                    law_metas.append({"data_type": "law", "source": item.get("source", ""),
-                                      "article_no": art_no, "parent_id": parent_id,
-                                      "chunk_idx": idx, "category": "", "title": "", "url": ""})
-
-        case_texts, case_metas = [], []
-        for fn in ["taipei_cases.json", "mol_qa_cases.json", "mol_fint_cases.json",
-                   "judicial_cases.json", "derived_interpretations.json"]:
-            for doc_idx, item in enumerate(_jload(fn)):
-                content = item.get("content", "").strip()
-                if not content:
-                    continue
-                source    = item.get("source", "")
-                category  = item.get("category", "")
-                label     = f"【{source} {category}】"
-                parent_id = f"{fn.replace('.json', '')}_{doc_idx}"
-                for idx, chunk in enumerate(_smart_split(content, 400, 50)[:50]):
-                    case_texts.append(f"{label}\n{chunk}")
-                    case_metas.append({"data_type": "case", "source": source, "category": category,
-                                       "title": item.get("title", "").strip(), "url": item.get("url", ""),
-                                       "parent_id": parent_id, "chunk_idx": idx, "article_no": ""})
-        return law_texts, law_metas, case_texts, case_metas
-
-    def _populate(client, name, texts, metas, model):
-        try:
-            client.delete_collection(name)
-        except Exception:
-            pass
-        col  = client.create_collection(name, metadata={"hnsw:space": "cosine"})
-        embs = model.encode(texts, batch_size=32, normalize_embeddings=True, show_progress_bar=False)
-        ids  = [f"{name}_{i}" for i in range(len(texts))]
-        for s in range(0, len(ids), 256):
-            col.add(ids=ids[s:s+256], embeddings=embs[s:s+256].tolist(),
-                    documents=texts[s:s+256], metadatas=metas[s:s+256])
-        return col
-
+def _populate_collection(client, name, emb, texts, metas, version):
+    """(Re)create a collection from precomputed vectors — no encoding."""
     try:
-        law_texts, law_metas, case_texts, case_metas = _load_data()
+        client.delete_collection(name)
+    except Exception:
+        pass
+    col = client.create_collection(name, metadata={"hnsw:space": "cosine", "corpus_version": version})
+    documents = [m.get("display_text", t) for t, m in zip(texts, metas)]
+    metadatas = [_sanitize_meta(t, m) for t, m in zip(texts, metas)]
+    for s in range(0, len(texts), 1000):
+        col.add(ids=[f"{name}_{i}" for i in range(s, min(s + 1000, len(texts)))],
+                embeddings=emb[s:s + 1000].tolist(),
+                documents=documents[s:s + 1000], metadatas=metadatas[s:s + 1000])
+    return col
 
-        chroma_client = chromadb.PersistentClient(path=_CHROMA_DB_PATH)
-        existing = {c.name for c in chroma_client.list_collections()}
 
-        if _BGE_LAW_COL in existing and _BGE_CASES_COL in existing:
-            law_col   = chroma_client.get_collection(_BGE_LAW_COL)
-            cases_col = chroma_client.get_collection(_BGE_CASES_COL)
-            if law_col.count() == len(law_texts) and cases_col.count() == len(case_texts):
-                model = SentenceTransformer("BAAI/bge-m3")
-                print(f"[CHROMA] bge-m3 索引就緒：law={law_col.count()}, cases={cases_col.count()}", flush=True)
-                return model, law_col, cases_col, law_texts, law_metas, case_texts, case_metas
+@st.cache_resource(show_spinner="正在準備索引…")
+def _load_chroma_index():
+    """Chroma collections filled from the precomputed vectors.
 
-        print(f"[CHROMA] 建立 bge-m3 索引（首次或資料更新後）…", flush=True)
-        model     = SentenceTransformer("BAAI/bge-m3")
-        law_col   = _populate(chroma_client, _BGE_LAW_COL,   law_texts,  law_metas,  model)
-        cases_col = _populate(chroma_client, _BGE_CASES_COL, case_texts, case_metas, model)
-        print(f"[CHROMA] 完成：law={law_col.count()}, cases={cases_col.count()}", flush=True)
-        return model, law_col, cases_col, law_texts, law_metas, case_texts, case_metas
-
+    Rebuilt only when missing or when corpus_version (content hash written by
+    build_index.py) changed; that takes seconds since nothing is re-encoded.
+    Returns (model, law_col, cases_col, law_texts, law_metas, case_texts,
+    case_metas), or None to signal the NumPy fallback.
+    """
+    try:
+        import chromadb
+        a = _load_artifacts()
+        client = chromadb.PersistentClient(path=_CHROMA_DB_PATH)
+        cols = {}
+        for kind, name in (("law", _LAW_COL_NAME), ("cases", _CASES_COL_NAME)):
+            emb, texts, metas, version = a[kind]
+            try:
+                col = client.get_collection(name)
+                fresh = (col.metadata or {}).get("corpus_version") == version and col.count() == len(texts)
+            except Exception:
+                col, fresh = None, False
+            if not fresh:
+                t0 = time.perf_counter()
+                col = _populate_collection(client, name, emb, texts, metas, version)
+                print(f"[CHROMA] {name}: 由預算向量重建 {col.count()} 筆，{time.perf_counter() - t0:.1f}s", flush=True)
+            cols[kind] = col
+        law, cases = a["law"], a["cases"]
+        print(f"[CHROMA] 索引就緒：law={cols['law'].count()}, cases={cols['cases'].count()}", flush=True)
+        return a["model"], cols["law"], cols["cases"], law[1], law[2], cases[1], cases[2]
     except Exception as e:
-        print(f"[CHROMA] bge-m3 索引失敗：{e}", flush=True)
+        print(f"[CHROMA] 索引失敗，改用 NumPy：{e}", flush=True)
         return None
 
 
@@ -989,9 +898,8 @@ def query_rag_system(
             _law_vec = lambda k, kc: _chroma_search(model, law_col, search_query, top_k=k, _top_k_chunks=kc)
         else:
             _law_vec = lambda k, kc: _search(model, search_query, law_emb, law_texts, law_metas, top_k=k, _top_k_chunks=kc)
-        _allowed_laws = set(plan.laws)
         l_results = _retrieve(_law_vec, "law", _backend, search_query, law_texts, law_metas,
-                              top_k=plan.law_k, allow=lambda m: m.get("source") in _allowed_laws)
+                              top_k=plan.law_k)
         _t_law_search = time.perf_counter()
 
         fired_mutex: set = set()

@@ -121,13 +121,14 @@ def _force_include_articles(query, results, texts, metas, keywords, force_articl
     # be checked to avoid injecting unrelated enforcement-rule articles.
     if not any(k in query for k in keywords):
         return results
-    existing = {m.get("article_no") for _, m, _ in results}
+    existing = {(m.get("source"), m.get("article_no")) for _, m, _ in results}
     forced = [
         (texts[i], m, None)
         for i, m in enumerate(metas)
         if m.get("article_no") in force_article_nos
-        and m.get("article_no") not in existing
         and m.get("source") == source
+        and (source, m.get("article_no")) not in existing
+        and not m.get("chunk_idx")   # one entry per article; display_text holds the full text
     ]
     return forced + results
 

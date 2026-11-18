@@ -11,3 +11,5 @@ numpy
 certifi
 pysqlite3-binary; sys_platform == "linux"
 psutil
+jieba
+rank_bm25

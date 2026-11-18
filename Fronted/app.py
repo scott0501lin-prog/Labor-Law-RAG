@@ -45,6 +45,9 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "chroma").lower()
 
+# BM25 (jieba) + vector fused by RRF; set HYBRID_SEARCH=0 for vector-only.
+HYBRID_SEARCH = os.getenv("HYBRID_SEARCH", "1") != "0"
+
 EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3").lower()
 if "text2vec" in EMBED_MODEL:
     _MODEL_NAME    = "shibing624/text2vec-base-chinese"
@@ -608,6 +611,35 @@ def _chroma_search(model, collection, query, top_k=5, _top_k_chunks=20):
     return ranked[:top_k]
 
 
+@st.cache_resource(show_spinner="正在建立關鍵字索引…")
+def _load_bm25(kind: str, backend: str, _texts: list, _metas: list):
+    """BM25 index per corpus. kind/backend form the cache key; the
+    underscore-prefixed lists are skipped by Streamlit's hasher."""
+    from hybrid_search import BM25Index
+    t0 = time.perf_counter()
+    idx = BM25Index(_texts, _metas)
+    print(f"[BM25] {kind}/{backend}: {len(_texts)} chunks in {time.perf_counter() - t0:.1f}s", flush=True)
+    return idx
+
+
+def _retrieve(vector_fn, kind: str, backend: str, query: str, texts: list, metas: list, top_k: int = 5):
+    """Vector search, optionally fused with BM25 via RRF.
+
+    vector_fn(top_k, top_k_chunks) -> [(text, meta, score)]
+    """
+    if not HYBRID_SEARCH:
+        return vector_fn(top_k, 20)
+    try:
+        from hybrid_search import rrf_merge
+        pool = 30
+        vec = vector_fn(pool, pool)
+        bm25_idx = _load_bm25(kind, backend, texts, metas).search(query, top_n=pool)
+        return rrf_merge(vec, bm25_idx, texts, metas, top_k=top_k, query=query)
+    except Exception as e:  # keyword layer must never break answering
+        print(f"[BM25] fallback to vector-only: {e}", flush=True)
+        return vector_fn(top_k, 20)
+
+
 # Force-include rules, constants, and helper functions live in force_rules.py
 # so eval/test_force_rules.py can import the real implementation without
 # pulling in Streamlit / Gemini / numpy.
@@ -910,10 +942,12 @@ def query_rag_system(
                     search_query = user_prompt
         _t_trans = time.perf_counter()
 
+        _backend = "chroma" if _use_chroma else "numpy"
         if _use_chroma:
-            l_results = _chroma_search(model, law_col, search_query, top_k=5)
+            _law_vec = lambda k, kc: _chroma_search(model, law_col, search_query, top_k=k, _top_k_chunks=kc)
         else:
-            l_results = _search(model, search_query, law_emb, law_texts, law_metas, top_k=5)
+            _law_vec = lambda k, kc: _search(model, search_query, law_emb, law_texts, law_metas, top_k=k, _top_k_chunks=kc)
+        l_results = _retrieve(_law_vec, "law", _backend, search_query, law_texts, law_metas, top_k=5)
         _t_law_search = time.perf_counter()
 
         fired_mutex: set = set()
@@ -931,9 +965,10 @@ def query_rag_system(
         _t_force_l = time.perf_counter()
 
         if _use_chroma:
-            c_results = _chroma_search(model, cases_col, search_query, top_k=5)
+            _case_vec = lambda k, kc: _chroma_search(model, cases_col, search_query, top_k=k, _top_k_chunks=kc)
         else:
-            c_results = _search(model, search_query, case_emb, case_texts, case_metas, top_k=5)
+            _case_vec = lambda k, kc: _search(model, search_query, case_emb, case_texts, case_metas, top_k=k, _top_k_chunks=kc)
+        c_results = _retrieve(_case_vec, "cases", _backend, search_query, case_texts, case_metas, top_k=5)
         _t_case_search = time.perf_counter()
 
         _overtime_kw = next(r["keywords"] for r in FORCE_ARTICLE_RULES if r["name"] == "加班延長工時")

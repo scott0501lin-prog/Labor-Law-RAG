@@ -7,7 +7,9 @@ Systems compared (top-5 law documents per query):
   before   text2vec-base-chinese, vector only, old index (law_embeddings.npy,
            勞基法 + 施行細則 only, old parent_id dedup) — the pre-review system
   vector   bge-m3, vector only, new index from backend/build_index.py
-  hybrid   bge-m3 + jieba BM25 fused by RRF (what the app runs)
+  hybrid   bge-m3 + jieba BM25 fused by RRF
+  +terms   hybrid, with the intent call's search_terms appended to the query
+           (what the app runs; terms cached by eval/gen_search_terms.py)
 
 Test set: eval/taipei_faq_testset.json — questions from 台北市勞動局常見問答
 (collected in backend/scraper2), expected articles = the statutes each
@@ -37,6 +39,14 @@ def load_taipei():
     with open(os.path.join(ROOT, "eval", "taipei_faq_testset.json"), encoding="utf-8") as f:
         return [(x["question"], [(e["law"], e["article_no"]) for e in x["expected"]])
                 for x in json.load(f)]
+
+
+def load_terms():
+    path = os.path.join(ROOT, "eval", "taipei_search_terms.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def load_index(prefix_suffix):
@@ -76,11 +86,16 @@ def main():
     old_model = SentenceTransformer("shibing624/text2vec-base-chinese")
     new_model = SentenceTransformer("BAAI/bge-m3")
     bm25 = BM25Index(new_texts, new_metas)
+    terms = load_terms()
 
     for name, items in sets.items():
         qs = [q for q, _ in items]
         old_q = old_model.encode(qs, normalize_embeddings=True)
         new_q = new_model.encode(qs, normalize_embeddings=True)
+        # Same as app: law query = question + search terms; article-citation
+        # boost still reads only the question.
+        tqs = [" ".join([q, *terms.get(q, [])]) for q in qs]
+        new_tq = new_model.encode(tqs, normalize_embeddings=True)
         rows = []
         for n, (q, exp) in enumerate(items):
             exp = [tuple(e) for e in exp]
@@ -91,21 +106,26 @@ def main():
             vector = [(m["source"], m["article_no"]) for _, m, _ in vec30[:K]]
             hyb = rrf_merge(vec30, bm25.search(q, 30), new_texts, new_metas, top_k=K, query=q)
             hybrid = [(m["source"], m["article_no"]) for _, m, _ in hyb]
+            tvec30 = [(new_texts[i], new_metas[i], 0.0) for i in vector_top(new_tq[n], new_emb, new_metas, 30)]
+            thyb = rrf_merge(tvec30, bm25.search(tqs[n], 30), new_texts, new_metas, top_k=K, query=q)
+            plus = [(m["source"], m["article_no"]) for _, m, _ in thyb]
             core = all(l in (LAB, RUL) for l, _ in exp)
-            rows.append((q, core, [score(r, exp) for r in (before, vector, hybrid)]))
+            rows.append((q, core, [score(r, exp) for r in (before, vector, hybrid, plus)]))
 
         print(f"\n=== {name}: {len(rows)} queries ===")
-        print(f"{'':<16}{'before':>9}{'vector':>9}{'hybrid':>9}")
+        print(f"{'':<16}{'before':>9}{'vector':>9}{'hybrid':>9}{'+terms':>9}")
         for label, sub in (("all", rows), ("core 勞基法+細則", [r for r in rows if r[1]])):
             if not sub:
                 continue
             for mi, metric in enumerate(("Hit@5", "Recall@5")):
-                vals = [sum(r[2][s][mi] for r in sub) / len(sub) for s in range(3)]
+                vals = [sum(r[2][s][mi] for r in sub) / len(sub) for s in range(4)]
                 print(f"{metric + ' ' + label:<16}" + "".join(f"{v:>9.0%}" for v in vals)
                       + (f"   (n={len(sub)})" if mi == 0 else ""))
-        misses = [q for q, _, s in rows if not s[2][0]]
+        if not terms:
+            print("(+terms = hybrid: eval/taipei_search_terms.json missing — run gen_search_terms.py)")
+        misses = [q for q, _, s in rows if not s[3][0]]
         if misses:
-            print(f"hybrid misses ({len(misses)}): " + " / ".join(m[:24] for m in misses[:15]))
+            print(f"+terms misses ({len(misses)}): " + " / ".join(m[:24] for m in misses[:15]))
 
 
 if __name__ == "__main__":

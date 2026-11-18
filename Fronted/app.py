@@ -532,11 +532,14 @@ def _load_bm25(kind: str, backend: str, _texts: list, _metas: list):
 
 
 def _retrieve(vector_fn, kind: str, backend: str, query: str, texts: list, metas: list,
-              top_k: int = 5, allow=None):
+              top_k: int = 5, allow=None, cite_query: str | None = None):
     """Vector search, optionally fused with BM25 via RRF.
 
     vector_fn(top_k, top_k_chunks) -> [(text, meta, score)]
     allow(meta) -> bool restricts results (e.g. to the laws the intent names).
+    cite_query: text scanned for explicit article citations (default *query*).
+        Pass the user's own question when *query* carries LLM search terms,
+        so a model-written article number can't trigger the citation boost.
     """
     pool = 30
 
@@ -551,7 +554,8 @@ def _retrieve(vector_fn, kind: str, backend: str, query: str, texts: list, metas
         from hybrid_search import rrf_merge
         vec = vector_fn(pool, pool)
         bm25_idx = _load_bm25(kind, backend, texts, metas).search(query, top_n=pool)
-        return rrf_merge(vec, bm25_idx, texts, metas, top_k=top_k, query=query, allow=allow)
+        return rrf_merge(vec, bm25_idx, texts, metas, top_k=top_k,
+                         query=cite_query or query, allow=allow)
     except Exception as e:  # keyword layer must never break answering
         print(f"[BM25] fallback to vector-only: {e}", flush=True)
         return _vector_only()
@@ -609,8 +613,20 @@ def _response_text(resp) -> str:
 _NO_THINKING = {"type": "disabled"}
 
 
-def _claude_json_call(prompt_text: str, _label: str = "intent") -> dict | None:
-    """Fire a Claude call and return parsed JSON dict, or None on any failure."""
+def _claude_json_call(prompt_text: str, _label: str = "intent", _attempts: int = 2) -> dict | None:
+    """Fire a Claude call and return parsed JSON dict, or None on any failure.
+
+    Retries once on an unparsable reply (rarely the model returns an empty
+    ```json``` fence); callers fall back to keyword heuristics on None.
+    """
+    for _attempt in range(_attempts):
+        result = _claude_json_call_once(prompt_text, _label)
+        if result is not None:
+            return result
+    return None
+
+
+def _claude_json_call_once(prompt_text: str, _label: str) -> dict | None:
     try:
         api_key = ANTHROPIC_API_KEY or os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
@@ -745,8 +761,10 @@ def _handle_prompt(prompt: str, persona: str, lang: str) -> str | Iterator[str]:
                 intent, laws = heuristic_intent(sq or qprompt), detect_laws(sq or qprompt)
             print(f"[INTENT] 分支: 直接 RAG | intent={intent!r} laws={laws} "
                   f"scenario={(analysis or {}).get('scenario')!r}")
+            terms = (analysis or {}).get("search_terms") or []
             return query_rag_system(qprompt, persona, lang, search_query_override=sq,
-                                    intent=intent, laws=laws)
+                                    intent=intent, laws=laws,
+                                    search_terms=[x for x in terms if isinstance(x, str)])
 
     if not ENABLE_INTENT_DETECTION:
         intent, laws = heuristic_intent(prompt), detect_laws(prompt)
@@ -831,6 +849,7 @@ def query_rag_system(
     missing_fields: list[str] | None = None,
     intent: str = "solve_problem",
     laws: list[str] | None = None,
+    search_terms: list[str] | None = None,
 ) -> str | Iterator[str]:
     """Run retrieval eagerly, then return a generator that streams the answer.
 
@@ -841,6 +860,9 @@ def query_rag_system(
         corpora, result counts, whether cases enter the prompt, and the answer
         format — see intent_router.make_plan.
 
+    search_terms: statutory wording from _analyze_intent, appended to the law
+        search query (vector + BM25). Bridges colloquial questions to the
+        article text: Hit@5 73% → 80% on the 台北 FAQ set (eval_retrieval.py).
     search_query_override: pre-translated Chinese query from _analyze_intent;
         if provided, the internal translation call is skipped.
     missing_fields: list of required field names that were not collected;
@@ -894,12 +916,13 @@ def query_rag_system(
         _t_trans = time.perf_counter()
 
         _backend = "chroma" if _use_chroma else "numpy"
+        law_query = " ".join([search_query, *(search_terms or [])])
         if _use_chroma:
-            _law_vec = lambda k, kc: _chroma_search(model, law_col, search_query, top_k=k, _top_k_chunks=kc)
+            _law_vec = lambda k, kc: _chroma_search(model, law_col, law_query, top_k=k, _top_k_chunks=kc)
         else:
-            _law_vec = lambda k, kc: _search(model, search_query, law_emb, law_texts, law_metas, top_k=k, _top_k_chunks=kc)
-        l_results = _retrieve(_law_vec, "law", _backend, search_query, law_texts, law_metas,
-                              top_k=plan.law_k)
+            _law_vec = lambda k, kc: _search(model, law_query, law_emb, law_texts, law_metas, top_k=k, _top_k_chunks=kc)
+        l_results = _retrieve(_law_vec, "law", _backend, law_query, law_texts, law_metas,
+                              top_k=plan.law_k, cite_query=search_query)
         _t_law_search = time.perf_counter()
 
         fired_mutex: set = set()
@@ -1383,12 +1406,20 @@ def show_chat_room():
 
 # Pre-load index at startup so the spinner shows immediately instead of on first query.
 # @st.cache_resource ensures this runs only once per process lifetime.
-if VECTOR_BACKEND == "chroma":
-    if _load_chroma_index() is None:
-        st.warning("⚠️ Chroma 索引載入失敗（已嘗試重建），已自動退回 NumPy 路徑。詳情請查看終端機日誌。")
-        _load_index()
+# The BM25 indexes are warmed here too: jieba-tokenising the case corpus
+# takes ~20 s, which would otherwise land on the first user's first question.
+_startup_backend = "numpy"
+_startup_res = _load_chroma_index() if VECTOR_BACKEND == "chroma" else None
+if _startup_res is not None:
+    _startup_backend = "chroma"
+    _, _, _, _lt, _lm, _ct, _cm = _startup_res
 else:
-    _load_index()
+    if VECTOR_BACKEND == "chroma":
+        st.warning("⚠️ Chroma 索引載入失敗（已嘗試重建），已自動退回 NumPy 路徑。詳情請查看終端機日誌。")
+    _, _, _lt, _lm, _, _ct, _cm = _load_index()
+if HYBRID_SEARCH:
+    _load_bm25("law", _startup_backend, _lt, _lm)
+    _load_bm25("cases", _startup_backend, _ct, _cm)
 
 inject_css()
 

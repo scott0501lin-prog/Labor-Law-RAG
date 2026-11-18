@@ -59,6 +59,7 @@ INTENT_ANALYSIS_PROMPT = """\
   "translated_query": "若原文非繁體中文請翻譯，否則原樣輸出",
   "intent": "solve_problem 或 find_cases 或 law_lookup 或 out_of_scope",
   "laws": ["相關法規，依關聯度排序，只能從：勞動基準法、勞動基準法施行細則、勞工退休金條例、勞工職業災害保險及保護法、最低工資法、勞工請假規則"],
+  "search_terms": ["3 到 6 個法規條文會使用的詞語，用來檢索法條"],
   "scenario": "overtime_pay 或 other",
   "known_info": {{
     "day_type": "平日 或 休息日 或 例假日 或 國定假日 或 null",
@@ -82,6 +83,11 @@ INTENT_ANALYSIS_PROMPT = """\
 - laws：退休金提繳與個人專戶把「勞工退休金條例」排第一；職災保險給付把「勞工職業災害保險及保護法」排第一；
   最低工資把「最低工資法」排第一；婚喪病事公假把「勞工請假規則」排第一；其餘勞動條件把「勞動基準法」排第一；
   問施行細則才把施行細則排第一。out_of_scope 時給空陣列
+- search_terms：把口語問題換成法規條文裡的用字，涵蓋判斷這個問題需要的法律概念，
+  不只是問題表面的字（例：「懷孕了公司還排我上夜班」→ 女工、妊娠期間、午後十時至翌晨六時、工作時間；
+  「週末被叫回公司值班」→ 休息日、例假、延長工作時間、工資加給；
+  「主管逼我簽自願離職」→ 終止勞動契約、資遣費、預告期間）。
+  不要寫條號。out_of_scope 時給空陣列
 - scenario overtime_pay：問題涉及加班費計算或補休換算
 - known_info：從訊息中提取已知值，未知設 null
 - missing_fields 必填欄位：day_type、hours、wage_amount（compensation_type 不追問）

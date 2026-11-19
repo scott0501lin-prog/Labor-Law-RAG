@@ -41,7 +41,24 @@ st.set_page_config(
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(base_dir, ".env"))
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+def _clean_secret(name: str) -> str | None:
+    """Env secret with stray whitespace / quotes removed.
+
+    Pasting a key into a hosting dashboard often adds a trailing newline or
+    the quotes from .env; httpx then rejects the header and the SDK reports
+    it as APIConnectionError, which looks like a network problem.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    val = raw.strip().strip('"').strip("'").strip()
+    # Log shape only, never the value.
+    print(f"[CONFIG] {name}: len={len(val)} prefix_ok={val.startswith('sk-ant-')} "
+          f"cleaned={val != raw}", flush=True)
+    return val or None
+
+
+ANTHROPIC_API_KEY = _clean_secret("ANTHROPIC_API_KEY")
 
 VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "chroma").lower()
 
@@ -628,7 +645,7 @@ def _claude_json_call(prompt_text: str, _label: str = "intent", _attempts: int =
 
 def _claude_json_call_once(prompt_text: str, _label: str) -> dict | None:
     try:
-        api_key = ANTHROPIC_API_KEY or os.getenv("ANTHROPIC_API_KEY")
+        api_key = ANTHROPIC_API_KEY
         if not api_key:
             print(f"[INTENT] [{_label}] API key 未設定，略過")
             return None
@@ -648,7 +665,7 @@ def _claude_json_call_once(prompt_text: str, _label: str) -> dict | None:
         print(f"[INTENT] [{_label}] 解析成功")
         return result
     except Exception as _e:
-        print(f"[INTENT] [{_label}] 解析失敗: {_e}")
+        print(f"[INTENT] [{_label}] 解析失敗: {_e} (cause: {_e.__cause__!r})")
         return None
 
 
@@ -876,7 +893,7 @@ def query_rag_system(
         return OUT_OF_SCOPE_TEXT
 
     try:
-        api_key = ANTHROPIC_API_KEY or os.getenv("ANTHROPIC_API_KEY")
+        api_key = ANTHROPIC_API_KEY
         if not api_key:
             return t(ui_lang, "err_no_api_key")
 

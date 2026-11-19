@@ -3,9 +3,8 @@ title: 勞資爭議智慧法務 AI 顧問
 emoji: ⚖️
 colorFrom: blue
 colorTo: indigo
-sdk: streamlit
-sdk_version: 1.45.0
-app_file: Fronted/app.py
+sdk: docker
+app_port: 8501
 pinned: false
 ---
 
@@ -114,14 +113,15 @@ streamlit run Fronted/app.py
 
 ## 雲端部署
 
-本系統部署於 **Hugging Face Spaces**（Streamlit SDK，設定見本檔開頭的 YAML）。
+本系統部署於 **Hugging Face Spaces**（Docker SDK，需 PRO 方案才能使用 CPU Basic；設定見本檔開頭的 YAML）。
 
 1. Space 的 **Settings → Variables and secrets** 設定 `ANTHROPIC_API_KEY` 與 `MONGO_URI`
-2. 將程式推送到 Space 的 git 儲存庫（向量索引透過 Git LFS 一併上傳）：
+2. 將程式推送到 Space（Docker SDK，見 `Dockerfile`）。腳本只推送執行需要的檔案，
+   並以單一 commit 上傳（舊歷史含有超過 10MB 的非 LFS 檔，HF 不接受）：
 
 ```bash
-git remote add space https://huggingface.co/spaces/<帳號>/<Space 名稱>
-git push space feature/scraper2-data:main
+git remote add space https://huggingface.co/spaces/<帳號>/<Space 名稱>   # 第一次
+bash scripts/deploy_hf.sh
 ```
 
 啟動時會載入 bge-m3 模型與預先算好的向量，寫入 ChromaDB 並建立 BM25 索引（約 1～2 分鐘），之後每題不需重新編碼文件。

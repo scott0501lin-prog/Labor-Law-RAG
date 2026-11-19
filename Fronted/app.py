@@ -52,9 +52,11 @@ def _clean_secret(name: str) -> str | None:
     if raw is None:
         return None
     val = raw.strip().strip('"').strip("'").strip()
-    # Log shape only, never the value.
-    print(f"[CONFIG] {name}: len={len(val)} prefix_ok={val.startswith('sk-ant-')} "
-          f"cleaned={val != raw}", flush=True)
+    # Warn on a suspicious shape (never log the value). Not on every rerun:
+    # Streamlit re-executes this module on each interaction.
+    if val != raw or not val.startswith("sk-ant-"):
+        print(f"[CONFIG] {name}: len={len(val)} prefix_ok={val.startswith('sk-ant-')} "
+              f"cleaned={val != raw}", flush=True)
     return val or None
 
 

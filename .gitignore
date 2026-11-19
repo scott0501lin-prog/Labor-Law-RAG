@@ -10,9 +10,14 @@ chat_histories/
 # 向量索引備份（本地備份，不上傳）
 backend/embeddings_v1_backup/
 
-# 向量嵌入檔（本地計算，體積大，不上傳）
-backend/embeddings/
+# 向量嵌入檔：只上傳 app 使用的 bge-m3 索引（Git LFS，見 .gitattributes），
+# 其餘（text2vec 舊索引等）留在本地
+backend/embeddings/*
 *.npy
+!backend/embeddings/law_embeddings_bgem3.npy
+!backend/embeddings/law_docs_bgem3.json
+!backend/embeddings/cases_embeddings_bgem3.npy
+!backend/embeddings/cases_docs_bgem3.json
 
 # 執行紀錄
 rag_timing.log

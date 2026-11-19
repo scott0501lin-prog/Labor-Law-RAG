@@ -18,14 +18,15 @@ FILES=(
   backend/embeddings/cases_docs_bgem3.json
 )
 
-git diff --quiet HEAD -- "${FILES[@]}" || { echo "Uncommitted changes in deploy files; commit first." >&2; exit 1; }
+git diff --quiet HEAD -- "${FILES[@]}" || echo "Note: uncommitted changes are NOT deployed (snapshot uses HEAD)." >&2
 src=$(git rev-parse --short HEAD)
 
-# Build the snapshot tree in a temporary index, leaving the working tree alone.
+# Build the snapshot tree from HEAD's committed blobs (LFS files stay as
+# pointers) in a temporary index, leaving the working tree alone.
 tmp_index=$(mktemp)
 trap 'rm -f "$tmp_index"' EXIT
 GIT_INDEX_FILE="$tmp_index" git read-tree --empty
-GIT_INDEX_FILE="$tmp_index" git add -f "${FILES[@]}"
+git ls-tree -r HEAD -- "${FILES[@]}" | GIT_INDEX_FILE="$tmp_index" git update-index --index-info
 tree=$(GIT_INDEX_FILE="$tmp_index" git write-tree)
 commit=$(git commit-tree "$tree" -m "deploy: snapshot of $(git rev-parse --abbrev-ref HEAD)@$src")
 

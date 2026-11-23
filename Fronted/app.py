@@ -550,6 +550,28 @@ def _load_bm25(kind: str, backend: str, _texts: list, _metas: list):
     return idx
 
 
+@st.cache_resource
+def _penalty_index(backend: str, _texts: list, _metas: list):
+    """(article → penalty articles map, (law, article) → (text, meta) of chunk 0)."""
+    pmap = build_penalty_map(_texts, _metas)
+    first = {}
+    for t, m in zip(_texts, _metas):
+        first.setdefault((m.get("source"), m.get("article_no")), (t, m))
+    print(f"[PENALTY] {backend}: {len(pmap)} articles mapped to penalty provisions", flush=True)
+    return pmap, first
+
+
+_PENALTY_KW = ("罰", "違法", "違反", "檢舉", "申訴")
+
+
+def _wants_penalty(query: str, violation: bool | None) -> bool:
+    """Employers always get the penalty exposure (it's their legal risk);
+    workers when the question is about a violation or asks about penalties."""
+    if st.session_state.get("user_role") == "Employer":
+        return True
+    return bool(violation) or any(k in query for k in _PENALTY_KW)
+
+
 def _retrieve(vector_fn, kind: str, backend: str, query: str, texts: list, metas: list,
               top_k: int = 5, allow=None, cite_query: str | None = None):
     """Vector search, optionally fused with BM25 via RRF.
@@ -602,6 +624,9 @@ from prompt_helpers import (
 )
 from intent_router import make_plan, heuristic_intent, detect_laws, INTENTS
 from eval_holdout import case_filter
+from penalties import build_penalty_map, penalties_for, label_paragraphs
+
+PENALTY_POOL = 10   # law results searched for penalty provisions when asked about 罰則
 
 # None in the live app; with EVAL_HOLDOUT=1 the test set's own FAQ answers
 # are excluded from case retrieval (see eval_holdout.py).
@@ -850,7 +875,8 @@ def _handle_prompt(prompt: str, persona: str, lang: str) -> str | Iterator[str]:
             terms = (analysis or {}).get("search_terms") or []
             return query_rag_system(qprompt, persona, lang, search_query_override=sq, history=history,
                                     intent=intent, laws=laws,
-                                    search_terms=[x for x in terms if isinstance(x, str)])
+                                    search_terms=[x for x in terms if isinstance(x, str)],
+                                    violation=(analysis or {}).get("violation"))
 
     if not ENABLE_INTENT_DETECTION:
         intent, laws = heuristic_intent(prompt), detect_laws(prompt)
@@ -945,6 +971,7 @@ def query_rag_system(
     laws: list[str] | None = None,
     search_terms: list[str] | None = None,
     history: list | None = None,
+    violation: bool | None = None,
 ) -> str | Iterator[str]:
     """Run retrieval eagerly, then return a generator that streams the answer.
 
@@ -961,6 +988,9 @@ def query_rag_system(
     history: earlier chat messages; the last few turns go into the answer
         call so follow-ups stay consistent (retrieval uses the rewritten
         standalone query from _analyze_intent instead).
+    violation: intent call's judgement that the question involves a possible
+        violation; decides (with the user role) whether penalty articles for
+        the retrieved articles are added — see penalties.py.
     search_query_override: pre-translated Chinese query from _analyze_intent;
         if provided, the internal translation call is skipped.
     missing_fields: list of required field names that were not collected;
@@ -1019,8 +1049,10 @@ def query_rag_system(
             _law_vec = lambda k, kc: _chroma_search(model, law_col, law_query, top_k=k, _top_k_chunks=kc)
         else:
             _law_vec = lambda k, kc: _search(model, law_query, law_emb, law_texts, law_metas, top_k=k, _top_k_chunks=kc)
-        l_results = _retrieve(_law_vec, "law", _backend, law_query, law_texts, law_metas,
-                              top_k=plan.law_k, cite_query=search_query)
+        # A few extra results are kept only for the penalty lookup below.
+        l_pool = _retrieve(_law_vec, "law", _backend, law_query, law_texts, law_metas,
+                           top_k=max(plan.law_k, PENALTY_POOL), cite_query=search_query)
+        l_results = l_pool[:plan.law_k]
         _t_law_search = time.perf_counter()
 
         fired_mutex: set = set()
@@ -1035,6 +1067,17 @@ def query_rag_system(
                 if rule["mutex"]:
                     fired_mutex.add(rule["mutex"])
         l_results = l_results[:MAX_FORCED_LAW_RESULTS]
+
+        # Penalty provisions cite articles only by number, so retrieval rarely
+        # finds them; look them up from the retrieved articles instead.
+        pen_results = []
+        if _wants_penalty(search_query, violation):
+            pmap, first = _penalty_index(_backend, law_texts, law_metas)
+            # Asked about penalties outright: the violated article may sit just
+            # below the top results (e.g. 勞基法 §70 for 「不訂工作規則有罰則嗎」).
+            asks = any(k in search_query for k in _PENALTY_KW)
+            src = l_results + (l_pool[plan.law_k:] if asks else [])
+            pen_results = [first[k] for k in penalties_for(src, pmap) if k in first]
         _t_force_l = time.perf_counter()
 
         if _use_chroma:
@@ -1055,6 +1098,10 @@ def query_rag_system(
         for d, m, _ in l_results:
             display = m.get("display_text", d)
             law_ctx += f"【法規內容】：{display}\n【條號】：{m.get('source', '')} {m.get('article_no', '')}\n\n"
+        for d, m in pen_results:
+            display = label_paragraphs(m.get("display_text", d))
+            law_ctx += (f"【罰則條文】（違反上列條文時的罰鍰）：{display}\n"
+                        f"【條號】：{m.get('source', '')} {m.get('article_no', '')}\n\n")
 
         # Cases go into the prompt per the plan (find_cases: all 5, consult: top 2,
         # law lookup: none); the full list is also kept for the "查看相似案例" button.
@@ -1519,6 +1566,7 @@ else:
 if HYBRID_SEARCH:
     _load_bm25("law", _startup_backend, _lt, _lm)
     _load_bm25("cases", _startup_backend, _ct, _cm)
+_penalty_index(_startup_backend, _lt, _lm)
 
 inject_css()
 

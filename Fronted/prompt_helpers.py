@@ -55,7 +55,7 @@ def build_missing_note(labels: str) -> str:
     )
 
 
-MODE_NAMES = {"consult": "諮詢", "cases": "案例", "law": "法條"}
+MODE_NAMES = {"consult": "諮詢", "general": "一般說明", "cases": "案例", "law": "法條"}
 
 _CASE_CHARS = 450  # per-case excerpt length in the prompt
 

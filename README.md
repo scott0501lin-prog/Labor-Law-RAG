@@ -126,7 +126,7 @@ bash scripts/deploy_hf.sh
 
 啟動時會載入 bge-m3 模型與預先算好的向量，寫入 ChromaDB 並建立 BM25 索引（約 1～2 分鐘），之後每題不需重新編碼文件。
 
-檢索評估：`python eval/eval_retrieval.py`（臺北市勞動局常見問答 93 題，法條 Hit@5 平均 78%，5 輪範圍 76%～78%；未加法條用語為 73%）。
+檢索評估：`python eval/eval_retrieval.py`（臺北市勞動局常見問答 93 題，法條 Hit@5 平均 75%，5 輪範圍 74%～77%；未加法條用語為 73%）。
 
 ---
 

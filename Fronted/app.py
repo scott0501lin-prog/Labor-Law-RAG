@@ -26,9 +26,8 @@ from intent_config import (
     MAX_FOLLOWUP_ROUNDS,
     SKIP_FOLLOWUP_TRIGGERS,
     SKIP_MAX_LEN,
-    MISSING_FIELDS_LABELS,
+    MAX_CLARIFY_QUESTIONS,
     INTENT_ANALYSIS_PROMPT,
-    OVERTIME_EXTRACTION_PROMPT,
 )
 
 st.set_page_config(
@@ -129,8 +128,7 @@ defaults = {
     "btn_input": None,
     "ui_lang": "繁體中文",
     # intent-detection state (reset when a complete RAG answer is given)
-    "intent_ctx": None,    # dict with original_query/translated_query/scenario/known_info
-    "followup_count": 0,   # number of follow-up rounds completed in current dialog
+    "intent_ctx": None,    # pending clarification: query/rounds/questions/analysis
     "_pending_cases": None,  # list[(text, meta, score)] from last RAG query; shown on button click
     "_show_cases": False,    # whether the case panel is expanded
 }
@@ -748,204 +746,139 @@ def _history_messages(history: list | None) -> list[dict]:
     return out
 
 
-def _analyze_intent(user_message: str, known_info: dict, ui_lang: str,
-                    history: list | None = None) -> dict | None:
-    """First-pass: classify intent, detect scenario, extract known fields.
+def _analyze_intent(user_message: str, ui_lang: str, history: list | None = None,
+                    clarify_allowed: bool = True) -> dict | None:
+    """One Claude call: standalone query, intent, laws, search terms, violation,
+    and whether to ask the user for missing facts first (clarify).
 
-    *history* (earlier chat messages) lets the model rewrite a follow-up
-    into a standalone translated_query.
-
-    Returns a dict with keys: translated_query, intent, scenario, known_info,
-    missing_fields, follow_up. Returns None on JSON parse failure (caller falls
-    back to the original RAG flow).
+    *history* (earlier chat messages) lets the model rewrite a follow-up — or
+    the user's answers to a clarifying question — into a standalone query.
+    Returns None on failure (callers fall back to keyword heuristics).
     """
     print(f"[INTENT] _analyze_intent 呼叫 | 問句: {user_message!r}")
     prompt = INTENT_ANALYSIS_PROMPT.format(
         history=_history_text(history),
         user_message=user_message,
-        known_info_json=_json.dumps(known_info, ensure_ascii=False),
         ui_lang=ui_lang,
+        clarify_allowed="可以" if clarify_allowed else "不可以（已問過，直接依現有資訊回答）",
     )
     result = _claude_json_call(prompt, _label="analyze_intent")
     if result:
         print(f"[INTENT]   query        = {result.get('translated_query')!r}")
-        print(f"[INTENT]   intent       = {result.get('intent')!r}")
-        print(f"[INTENT]   scenario     = {result.get('scenario')!r}")
-        print(f"[INTENT]   known_info   = {result.get('known_info')}")
-        print(f"[INTENT]   missing_fields = {result.get('missing_fields')}")
-        print(f"[INTENT]   follow_up    = {result.get('follow_up')!r}")
+        print(f"[INTENT]   followup={result.get('is_followup')} intent={result.get('intent')!r} "
+              f"violation={result.get('violation')} clarify={result.get('clarify')}")
     else:
         print("[INTENT] _analyze_intent: 結果為 None（解析失敗）")
     return result
 
 
-def _extract_overtime_fields(user_message: str, known_info: dict, ui_lang: str) -> dict | None:
-    """Mid-dialog extraction: parse field values from a follow-up answer.
+class ClarifyReply(str):
+    """An assistant reply that asks for missing facts before answering.
 
-    Does NOT re-classify intent. Returns a dict with is_new_question, known_info,
-    missing_fields, follow_up. Returns None on failure (caller falls back).
+    A str, so callers that display or save replies keep working; it also
+    carries the structured questions, which the chat UI renders as option
+    buttons under the message.
     """
-    print(f"[INTENT] _extract_overtime_fields 呼叫 | 回覆: {user_message!r}")
-    prompt = OVERTIME_EXTRACTION_PROMPT.format(
-        user_message=user_message,
-        known_info_json=_json.dumps(known_info, ensure_ascii=False),
-        ui_lang=ui_lang,
-    )
-    result = _claude_json_call(prompt, _label="extract_fields")
-    if result:
-        print(f"[INTENT]   is_new_question = {result.get('is_new_question')}")
-        print(f"[INTENT]   known_info      = {result.get('known_info')}")
-        print(f"[INTENT]   missing_fields  = {result.get('missing_fields')}")
-        print(f"[INTENT]   follow_up       = {result.get('follow_up')!r}")
-    else:
-        print("[INTENT] _extract_overtime_fields: 結果為 None（解析失敗）")
-    return result
+
+    def __new__(cls, text: str, questions: list[dict]):
+        obj = super().__new__(cls, text)
+        obj.questions = questions
+        return obj
 
 
-def _build_enriched_query(translated_query: str, known_info: dict) -> str:
-    """Append collected field values to translated_query for a richer RAG search."""
-    parts = [translated_query]
-    if known_info.get("day_type"):
-        parts.append(known_info["day_type"])
-    if known_info.get("hours") is not None:
-        parts.append(f"加班 {known_info['hours']} 小時")
-    if known_info.get("wage_type") and known_info.get("wage_amount"):
-        parts.append(f"{known_info['wage_type']} {known_info['wage_amount']} 元")
-    elif known_info.get("wage_type"):
-        parts.append(known_info["wage_type"])
-    elif known_info.get("wage_amount"):
-        parts.append(f"薪資 {known_info['wage_amount']} 元")
-    if known_info.get("compensation_type"):
-        parts.append(known_info["compensation_type"])
-    return "，".join(parts)
+def _clean_questions(raw) -> list[dict]:
+    """Validate the model's clarify.questions: [{"q": str, "options": [str]}]."""
+    out = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict) or not str(item.get("q") or "").strip():
+            continue
+        opts = [str(o).strip() for o in (item.get("options") or []) if str(o).strip()]
+        out.append({"q": str(item["q"]).strip(), "options": opts[:4]})
+    return out[:MAX_CLARIFY_QUESTIONS]
 
 
-_QUESTION_MARKERS = ("?", "？", "嗎", "如何", "怎麼", "是否", "可否", "可以", "能否", "為何", "什麼", "多少")
+def _clarify_text(questions: list[dict], lang: str) -> str:
+    lines = [t(lang, "clarify_lead"), ""]
+    lines += [f"{n}. {q['q']}" for n, q in enumerate(questions, 1)]
+    lines += ["", t(lang, "clarify_hint")]
+    return "\n".join(lines)
 
 
-def _looks_like_question(text: str) -> bool:
-    return any(k in text for k in _QUESTION_MARKERS) and len(text) > SKIP_MAX_LEN
+def _is_skip(text: str) -> bool:
+    return len(text) <= SKIP_MAX_LEN and any(kw in text for kw in SKIP_FOLLOWUP_TRIGGERS)
 
 
 def _handle_prompt(prompt: str, persona: str, lang: str) -> str | Iterator[str]:
-    """Route a user prompt through intent detection + optional follow-up + RAG.
+    """Route a user message: ask for missing facts first, or answer.
 
-    Falls back to query_rag_system() directly whenever intent detection is
-    disabled, JSON parsing fails, or the scenario is not overtime_pay.
+    Flow (design doc step 3, generalised from the old overtime-only follow-up):
+      - The intent call decides whether facts the user hasn't given would
+        change the answer. If so, reply with up to 3 clarifying questions
+        (ClarifyReply, shown with option buttons) instead of answering.
+      - The user's reply goes through the same call; with the conversation
+        history it is rewritten into one complete question (original question
+        + answers). At most MAX_FOLLOWUP_ROUNDS rounds.
+      - Skipping (「直接回答」) or running out of rounds gives a general answer
+        that says which facts would change it.
     """
-    print(f"[INTENT] ── _handle_prompt ──────────────────────────────")
-    print(f"[INTENT] ENABLE_INTENT_DETECTION = {ENABLE_INTENT_DETECTION}")
-    print(f"[INTENT] 使用者問句: {prompt!r}")
     msgs = st.session_state.messages
     history = msgs[:-1] if msgs and msgs[-1].get("role") == "user" else list(msgs)
-
-    def _is_skip(text: str) -> bool:
-        return (
-            len(text) <= SKIP_MAX_LEN
-            and any(kw in text for kw in SKIP_FOLLOWUP_TRIGGERS)
-        )
-
-    def _new_question(qprompt: str) -> str:
-        """Handle a fresh (non-mid-dialog) question."""
-        analysis = _analyze_intent(qprompt, {}, lang, history)
-        if (
-            analysis
-            and analysis.get("intent") == "solve_problem"
-            and analysis.get("scenario") == "overtime_pay"
-            and analysis.get("missing_fields")
-            and not _is_skip(qprompt)
-        ):
-            print(f"[INTENT] 分支: 追問 | follow_up={analysis.get('follow_up')!r}")
-            st.session_state.intent_ctx = {
-                "original_query":   qprompt,
-                "translated_query": analysis.get("translated_query") or qprompt,
-                "scenario":         "overtime_pay",
-                "known_info":       analysis.get("known_info") or {},
-            }
-            st.session_state.followup_count = 0
-            return analysis.get("follow_up") or ""
-        else:
-            sq = analysis.get("translated_query") if analysis else None
-            if analysis and analysis.get("intent") in INTENTS:
-                intent, laws = analysis["intent"], analysis.get("laws") or detect_laws(sq or qprompt)
-            else:  # LLM call / JSON failed → keyword fallback
-                intent, laws = heuristic_intent(sq or qprompt), detect_laws(sq or qprompt)
-            print(f"[INTENT] 分支: 直接 RAG | intent={intent!r} laws={laws} "
-                  f"scenario={(analysis or {}).get('scenario')!r}")
-            terms = (analysis or {}).get("search_terms") or []
-            return query_rag_system(qprompt, persona, lang, search_query_override=sq, history=history,
-                                    intent=intent, laws=laws,
-                                    search_terms=[x for x in terms if isinstance(x, str)],
-                                    violation=(analysis or {}).get("violation"))
+    ctx = st.session_state.intent_ctx   # set while we're waiting for clarifying answers
+    print(f"[INTENT] ── _handle_prompt ── {prompt!r} | 補問中={'是' if ctx else '否'}")
 
     if not ENABLE_INTENT_DETECTION:
+        st.session_state.intent_ctx = None
         intent, laws = heuristic_intent(prompt), detect_laws(prompt)
         print(f"[INTENT] 功能關閉 → 關鍵字分類 intent={intent!r} laws={laws}")
         return query_rag_system(prompt, persona, lang, intent=intent, laws=laws, history=history)
 
-    ctx = st.session_state.intent_ctx
-    print(f"[INTENT] intent_ctx = {'有進行中對話' if ctx else '無 (新問題)'}")
-
-    if ctx is not None:
-        # ── Mid-dialog: processing a follow-up answer ─────────────────────
-        if _is_skip(prompt):
-            print(f"[INTENT] 分支: mid-dialog 跳過 → 直接 RAG (原問句)")
-            st.session_state.intent_ctx = None
-            st.session_state.followup_count = 0
-            return query_rag_system(
-                ctx["original_query"], persona, lang,
-                search_query_override=ctx["translated_query"], history=history,
-            )
-
-        result = _extract_overtime_fields(prompt, ctx["known_info"], lang)
-        if result is None:
-            # JSON failure → fallback with what we have
-            print("[INTENT] 分支: extraction 解析失敗 → fallback RAG (原問句)")
-            st.session_state.intent_ctx = None
-            st.session_state.followup_count = 0
-            return query_rag_system(
-                ctx["original_query"], persona, lang,
-                search_query_override=ctx["translated_query"], history=history,
-            )
-
-        gained = any(v is not None and ctx["known_info"].get(k) != v
-                     for k, v in (result.get("known_info") or {}).items())
-        if not result.get("is_new_question") and not gained and _looks_like_question(prompt):
-            # The extractor sometimes calls an unrelated question an answer
-            # (e.g. 「預告工資以何薪資為基準？」 during an overtime follow-up).
-            print("[INTENT] 未取得任何欄位且訊息是問句 → 視為新問題")
-            result["is_new_question"] = True
-        if result.get("is_new_question"):
-            print("[INTENT] 分支: is_new_question=True → 清空 ctx，重新分析新問題")
-            st.session_state.intent_ctx = None
-            st.session_state.followup_count = 0
-            return _new_question(prompt)
-
-        # Merge new non-null values into known_info
-        for k, v in (result.get("known_info") or {}).items():
-            if v is not None:
-                ctx["known_info"][k] = v
-        st.session_state.followup_count += 1
-        missing = result.get("missing_fields") or []
-
-        if missing and st.session_state.followup_count < MAX_FOLLOWUP_ROUNDS:
-            print(f"[INTENT] 分支: 繼續追問 (round={st.session_state.followup_count}) | missing={missing}")
-            return result.get("follow_up") or ""
-
-        # Reached limit or all fields collected → proceed to RAG
-        enriched = _build_enriched_query(ctx["translated_query"], ctx["known_info"])
-        print(f"[INTENT] 分支: 追問完成 → RAG | enriched={enriched!r} | missing={missing or None}")
+    if ctx and _is_skip(prompt):
+        print("[INTENT] 使用者跳過補問 → 一般說明")
         st.session_state.intent_ctx = None
-        st.session_state.followup_count = 0
-        return query_rag_system(
-            enriched, persona, lang,
-            search_query_override=enriched,
-            missing_fields=missing or None,
-            history=history,
-        )
+        return _answer(ctx["query"], ctx["analysis"], persona, lang, history,
+                       unanswered=ctx["questions"])
 
-    else:
-        return _new_question(prompt)
+    rounds = ctx["rounds"] if ctx else 0
+    analysis = _analyze_intent(prompt, lang, history,
+                               clarify_allowed=rounds < MAX_FOLLOWUP_ROUNDS)
+    if analysis is None:                  # LLM call / JSON failed → keyword fallback
+        st.session_state.intent_ctx = None
+        intent, laws = heuristic_intent(prompt), detect_laws(prompt)
+        return query_rag_system(prompt, persona, lang, intent=intent, laws=laws, history=history)
+
+    if ctx and not analysis.get("is_followup"):
+        rounds = 0                        # the user moved on to a new question
+    query = analysis.get("translated_query") or prompt
+    cl = analysis.get("clarify") or {}
+    questions = _clean_questions(cl.get("questions"))
+    needs = bool(cl.get("needed")) and bool(questions) and analysis.get("intent") == "solve_problem"
+
+    if needs and rounds < MAX_FOLLOWUP_ROUNDS:
+        print(f"[INTENT] 分支: 補問 (round={rounds + 1}) | {[q['q'] for q in questions]}")
+        st.session_state.intent_ctx = {"query": query, "rounds": rounds + 1,
+                                       "questions": questions, "analysis": analysis}
+        st.session_state["_pending_cases"] = None
+        return ClarifyReply(_clarify_text(questions, lang), questions)
+
+    st.session_state.intent_ctx = None
+    return _answer(query, analysis, persona, lang, history,
+                   unanswered=questions if needs else [])
+
+
+def _answer(query: str, analysis: dict, persona: str, lang: str, history: list,
+            unanswered: list[dict] | None = None):
+    """Retrieve + generate for a standalone *query*. *unanswered* clarifying
+    questions switch the answer to the general format and are listed as the
+    information still needed."""
+    intent = analysis.get("intent") if analysis.get("intent") in INTENTS else heuristic_intent(query)
+    laws = analysis.get("laws") or detect_laws(query)
+    terms = [x for x in (analysis.get("search_terms") or []) if isinstance(x, str)]
+    missing = [q["q"] for q in (unanswered or [])]
+    print(f"[INTENT] 分支: 回答 | intent={intent!r} laws={laws} general={bool(missing)}")
+    return query_rag_system(query, persona, lang, search_query_override=query,
+                            intent=intent, laws=laws, search_terms=terms,
+                            violation=analysis.get("violation"), history=history,
+                            missing_fields=missing or None, general=bool(missing))
 
 
 # ==========================================
@@ -972,6 +905,7 @@ def query_rag_system(
     search_terms: list[str] | None = None,
     history: list | None = None,
     violation: bool | None = None,
+    general: bool = False,
 ) -> str | Iterator[str]:
     """Run retrieval eagerly, then return a generator that streams the answer.
 
@@ -984,7 +918,7 @@ def query_rag_system(
 
     search_terms: statutory wording from _analyze_intent, appended to the law
         search query (vector + BM25). Bridges colloquial questions to the
-        article text: Hit@5 73% → 78% mean (76-78% over 5 sampled runs) on the 台北 FAQ set (eval_retrieval.py).
+        article text: Hit@5 73% → 75% mean (74-77% over 5 sampled runs) on the 台北 FAQ set (eval_retrieval.py).
     history: earlier chat messages; the last few turns go into the answer
         call so follow-ups stay consistent (retrieval uses the rewritten
         standalone query from _analyze_intent instead).
@@ -993,9 +927,10 @@ def query_rag_system(
         the retrieved articles are added — see penalties.py.
     search_query_override: pre-translated Chinese query from _analyze_intent;
         if provided, the internal translation call is skipped.
-    missing_fields: list of required field names that were not collected;
-        if non-empty, a disclaimer is appended to final_prompt asking Gemini
-        NOT to assume values.
+    missing_fields: facts the user didn't give (the unanswered clarifying
+        questions); listed in the prompt so the model doesn't assume them.
+    general: the user skipped the clarifying questions; a consult answer uses
+        the 「一般說明」 format (no 結論 the facts can't support).
     """
     plan = make_plan(intent, laws)
     if plan is None:
@@ -1112,13 +1047,13 @@ def query_rag_system(
         # 回答語言邏輯：永遠跟著 UI 語言選項走。
         lang_rule = build_lang_rule(ui_lang, LANGUAGES.get(ui_lang, "Traditional Chinese"))
 
-        # Missing-fields disclaimer — only appended when fields were still absent
-        # after the follow-up dialog, so Gemini won't invent numbers.
-        labels = "、".join(MISSING_FIELDS_LABELS.get(f, f) for f in (missing_fields or []))
-        missing_note = build_missing_note(labels)
+        # Facts still missing after the clarifying round(s), so the model
+        # won't invent numbers or pick one scenario.
+        missing_note = build_missing_note("；".join(missing_fields or []))
+        mode = "general" if general and plan.mode == "consult" else plan.mode
 
         final_prompt = build_user_prompt(law_ctx, user_prompt, lang_rule, missing_note,
-                                         case_ctx=case_ctx, mode=plan.mode)
+                                         case_ctx=case_ctx, mode=mode)
         _t_prompt = time.perf_counter()
 
     except Exception as e:
@@ -1322,6 +1257,7 @@ def show_landing_page():
             st.session_state.user_role        = "Employee"
             st.session_state.page             = "Chat"
             st.session_state.messages         = []
+            st.session_state.intent_ctx = None   # drop a pending clarification
             st.session_state.current_chat_id  = None
             st.rerun()
 
@@ -1343,6 +1279,7 @@ def show_landing_page():
             st.session_state.user_role        = "Employer"
             st.session_state.page             = "Chat"
             st.session_state.messages         = []
+            st.session_state.intent_ctx = None   # drop a pending clarification
             st.session_state.current_chat_id  = None
             st.rerun()
 
@@ -1352,6 +1289,40 @@ def show_landing_page():
         f"{t(lang, 'landing_caption').format(username=st.session_state.username)}</p>",
         unsafe_allow_html=True,
     )
+
+
+CLARIFY_SKIP_TEXT = "直接回答"   # matches SKIP_FOLLOWUP_TRIGGERS in every UI language
+
+
+def _render_clarify_form(questions: list[dict], lang: str, n: str) -> None:
+    """Option buttons for the clarifying questions. Submitting sends the picks
+    as the user's next message (「問題：選項；…」), which _handle_prompt merges
+    with the original question; the user can also just type in the chat box.
+
+    *n* makes the widget keys unique per clarification round: reused keys
+    would pre-fill a new round (or a new chat) with the previous picks."""
+    with st.form(f"clarify_{n}"):
+        picks = []
+        for i, q in enumerate(questions):
+            if q["options"]:
+                v = st.radio(q["q"], q["options"], index=None, horizontal=True, key=f"cq_{n}_{i}")
+            else:
+                v = st.text_input(q["q"], key=f"cq_{n}_{i}")
+            picks.append((q["q"], v))
+        extra = st.text_input(t(lang, "clarify_other"), key=f"cq_{n}_x")
+        c1, c2 = st.columns(2)
+        sent = c1.form_submit_button(t(lang, "clarify_submit"), type="primary")
+        skip = c2.form_submit_button(t(lang, "clarify_skip"))
+    if skip:
+        st.session_state.btn_input = CLARIFY_SKIP_TEXT
+        st.rerun()
+    if sent:
+        parts = [f"{q}：{v}" for q, v in picks if v]
+        if extra and extra.strip():
+            parts.append(extra.strip())
+        if parts:
+            st.session_state.btn_input = "；".join(parts)
+            st.rerun()
 
 
 def _render_case_results(c_results: list, lang: str) -> None:
@@ -1428,6 +1399,7 @@ def show_chat_room():
 
         if st.button(t(lang, "btn_new_chat"), use_container_width=True):
             st.session_state.messages        = []
+            st.session_state.intent_ctx = None   # drop a pending clarification
             st.session_state.current_chat_id = None
             st.session_state["_pending_cases"] = None
             st.session_state["_show_cases"]    = False
@@ -1436,6 +1408,7 @@ def show_chat_room():
         if st.button(t(lang, "btn_switch_role"), use_container_width=True):
             st.session_state.page            = "Landing"
             st.session_state.messages        = []
+            st.session_state.intent_ctx = None   # drop a pending clarification
             st.session_state.current_chat_id = None
             st.session_state["_pending_cases"] = None
             st.session_state["_show_cases"]    = False
@@ -1483,6 +1456,7 @@ def show_chat_room():
                 label = chat.get("title") or time_str
                 if st.button(label, key=cid, help=time_str, use_container_width=True):
                     st.session_state.messages        = load_chat(st.session_state.username, cid)
+                    st.session_state.intent_ctx = None   # drop a pending clarification
                     st.session_state.current_chat_id = cid
                     st.rerun()
 
@@ -1514,6 +1488,12 @@ def show_chat_room():
         else:
             _render_case_results(st.session_state["_pending_cases"], lang)
 
+    # ── Clarifying questions: option buttons under the latest assistant message ──
+    _last = st.session_state.messages[-1] if st.session_state.messages else None
+    if _last and _last.get("role") == "assistant" and _last.get("clarify"):
+        _render_clarify_form(_last["clarify"], lang,
+                             _last.get("clarify_id") or str(len(st.session_state.messages)))
+
     prompt = st.chat_input(t(lang, "chat_input_placeholder"))
     if st.session_state.btn_input:
         prompt = st.session_state.btn_input
@@ -1536,7 +1516,11 @@ def show_chat_room():
                 st.markdown(resp)
             else:
                 resp = st.write_stream(resp)
-        st.session_state.messages.append({"role": "assistant", "content": resp})
+        reply = {"role": "assistant", "content": str(resp)}
+        if isinstance(resp, ClarifyReply):
+            reply["clarify"] = resp.questions      # rendered as option buttons
+            reply["clarify_id"] = uuid.uuid4().hex  # unique widget keys per round
+        st.session_state.messages.append(reply)
 
         if not st.session_state.current_chat_id:
             st.session_state.current_chat_id = str(uuid.uuid4())

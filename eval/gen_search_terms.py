@@ -41,7 +41,7 @@ def main():
         qs = [x["question"] for x in json.load(f)]
 
     def terms(q):
-        prompt = INTENT_ANALYSIS_PROMPT.format(history="（無）", known_info_json="{}", user_message=q, ui_lang="繁體中文")
+        prompt = INTENT_ANALYSIS_PROMPT.format(history="（無）", user_message=q, ui_lang="繁體中文", clarify_allowed="可以")
         for _ in range(3):
             try:
                 r = client.messages.create(model=MODEL, max_tokens=1024, thinking={"type": "disabled"},

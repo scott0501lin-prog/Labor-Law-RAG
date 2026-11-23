@@ -9,7 +9,9 @@ Systems compared (top-5 law documents per query):
   vector   bge-m3, vector only, new index from backend/build_index.py
   hybrid   bge-m3 + jieba BM25 fused by RRF
   +terms   hybrid, with the intent call's search_terms appended to the query
-           (what the app runs; terms cached by eval/gen_search_terms.py)
+           (what the app runs; terms cached by eval/gen_search_terms.py).
+           Terms are sampled, so this column is the mean over the cached runs;
+           the per-run range is printed below the table.
 
 Test set: eval/taipei_faq_testset.json — questions from 台北市勞動局常見問答
 (collected in backend/scraper2), expected articles = the statutes each
@@ -42,11 +44,13 @@ def load_taipei():
 
 
 def load_terms():
+    """{question: [[term, ...] per run]} (old single-run files are wrapped)."""
     path = os.path.join(ROOT, "eval", "taipei_search_terms.json")
     if not os.path.exists(path):
         return {}
     with open(path, encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    return {q: (v if v and isinstance(v[0], list) else [v]) for q, v in data.items()}
 
 
 def load_index(prefix_suffix):
@@ -93,9 +97,11 @@ def main():
         old_q = old_model.encode(qs, normalize_embeddings=True)
         new_q = new_model.encode(qs, normalize_embeddings=True)
         # Same as app: law query = question + search terms; article-citation
-        # boost still reads only the question.
-        tqs = [" ".join([q, *terms.get(q, [])]) for q in qs]
-        new_tq = new_model.encode(tqs, normalize_embeddings=True)
+        # boost still reads only the question. One query list per run.
+        n_runs = max((len(v) for v in terms.values()), default=0) or 1
+        run_tqs = [[" ".join([q, *(terms.get(q) or [[]] * n_runs)[r]]) for q in qs]
+                   for r in range(n_runs)]
+        run_tq = [new_model.encode(t, normalize_embeddings=True) for t in run_tqs]
         rows = []
         for n, (q, exp) in enumerate(items):
             exp = [tuple(e) for e in exp]
@@ -106,11 +112,17 @@ def main():
             vector = [(m["source"], m["article_no"]) for _, m, _ in vec30[:K]]
             hyb = rrf_merge(vec30, bm25.search(q, 30), new_texts, new_metas, top_k=K, query=q)
             hybrid = [(m["source"], m["article_no"]) for _, m, _ in hyb]
-            tvec30 = [(new_texts[i], new_metas[i], 0.0) for i in vector_top(new_tq[n], new_emb, new_metas, 30)]
-            thyb = rrf_merge(tvec30, bm25.search(tqs[n], 30), new_texts, new_metas, top_k=K, query=q)
-            plus = [(m["source"], m["article_no"]) for _, m, _ in thyb]
+            per_run = []
+            for r in range(n_runs):
+                tvec30 = [(new_texts[i], new_metas[i], 0.0)
+                          for i in vector_top(run_tq[r][n], new_emb, new_metas, 30)]
+                thyb = rrf_merge(tvec30, bm25.search(run_tqs[r][n], 30), new_texts, new_metas,
+                                 top_k=K, query=q)
+                per_run.append(score([(m["source"], m["article_no"]) for _, m, _ in thyb], exp))
+            plus = (sum(h for h, _ in per_run) / n_runs, sum(rc for _, rc in per_run) / n_runs)
             core = all(l in (LAB, RUL) for l, _ in exp)
-            rows.append((q, core, [score(r, exp) for r in (before, vector, hybrid, plus)]))
+            rows.append((q, core, [score(r, exp) for r in (before, vector, hybrid)] + [plus],
+                         per_run))
 
         print(f"\n=== {name}: {len(rows)} queries ===")
         print(f"{'':<16}{'before':>9}{'vector':>9}{'hybrid':>9}{'+terms':>9}")
@@ -123,9 +135,14 @@ def main():
                       + (f"   (n={len(sub)})" if mi == 0 else ""))
         if not terms:
             print("(+terms = hybrid: eval/taipei_search_terms.json missing — run gen_search_terms.py)")
-        misses = [q for q, _, s in rows if not s[3][0]]
+        else:
+            hits = [sum(r[3][k][0] for r in rows) / len(rows) for k in range(n_runs)]
+            print(f"+terms Hit@5 per run ({n_runs} runs): "
+                  + ", ".join(f"{h:.0%}" for h in hits)
+                  + f"   range {min(hits):.0%}-{max(hits):.0%}")
+        misses = [q for q, _, s, _ in rows if s[3][0] < 0.5]
         if misses:
-            print(f"+terms misses ({len(misses)}): " + " / ".join(m[:24] for m in misses[:15]))
+            print(f"+terms misses in most runs ({len(misses)}): " + " / ".join(m[:24] for m in misses[:15]))
 
 
 if __name__ == "__main__":

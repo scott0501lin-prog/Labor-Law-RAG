@@ -678,8 +678,57 @@ def _claude_json_call_once(prompt_text: str, _label: str) -> dict | None:
         return None
 
 
-def _analyze_intent(user_message: str, known_info: dict, ui_lang: str) -> dict | None:
+# ── Conversation history ─────────────────────────────────────────────────────
+# Follow-ups like 「那休息日呢？」 only make sense with the earlier turns: the
+# intent call rewrites them into a standalone query (translated_query) for
+# retrieval, and the answer call sees the recent turns so it stays consistent
+# with numbers the user already gave.
+HISTORY_TURNS = 3          # user+assistant pairs kept
+_HIST_INTENT_CHARS = 300   # per message, in the intent prompt
+_HIST_ANSWER_CHARS = 800   # per assistant message, in the answer call
+
+
+def _recent(history: list | None) -> list[dict]:
+    msgs = [m for m in (history or []) if m.get("role") in ("user", "assistant")]
+    return msgs[-2 * HISTORY_TURNS:]
+
+
+def _clip(text, n: int) -> str:
+    text = str(text)
+    return text if len(text) <= n else text[:n] + "…（略）"
+
+
+def _history_text(history: list | None) -> str:
+    """Recent turns as plain text for the intent prompt."""
+    lines = [f"{'使用者' if m['role'] == 'user' else '助理'}：{_clip(m['content'], _HIST_INTENT_CHARS)}"
+             for m in _recent(history)]
+    return "\n".join(lines) or "（無）"
+
+
+def _history_messages(history: list | None) -> list[dict]:
+    """Recent turns as API messages: must start with a user turn and alternate."""
+    out: list[dict] = []
+    for m in _recent(history):
+        if not out and m["role"] != "user":
+            continue
+        if out and out[-1]["role"] == m["role"]:
+            out[-1]["content"] += "\n" + str(m["content"])   # merge same-role runs
+            continue
+        out.append({"role": m["role"], "content": str(m["content"])})
+    if out and out[-1]["role"] == "user":                    # next message is ours
+        out.pop()
+    for m in out:
+        if m["role"] == "assistant":
+            m["content"] = _clip(m["content"], _HIST_ANSWER_CHARS)
+    return out
+
+
+def _analyze_intent(user_message: str, known_info: dict, ui_lang: str,
+                    history: list | None = None) -> dict | None:
     """First-pass: classify intent, detect scenario, extract known fields.
+
+    *history* (earlier chat messages) lets the model rewrite a follow-up
+    into a standalone translated_query.
 
     Returns a dict with keys: translated_query, intent, scenario, known_info,
     missing_fields, follow_up. Returns None on JSON parse failure (caller falls
@@ -687,12 +736,14 @@ def _analyze_intent(user_message: str, known_info: dict, ui_lang: str) -> dict |
     """
     print(f"[INTENT] _analyze_intent 呼叫 | 問句: {user_message!r}")
     prompt = INTENT_ANALYSIS_PROMPT.format(
+        history=_history_text(history),
         user_message=user_message,
         known_info_json=_json.dumps(known_info, ensure_ascii=False),
         ui_lang=ui_lang,
     )
     result = _claude_json_call(prompt, _label="analyze_intent")
     if result:
+        print(f"[INTENT]   query        = {result.get('translated_query')!r}")
         print(f"[INTENT]   intent       = {result.get('intent')!r}")
         print(f"[INTENT]   scenario     = {result.get('scenario')!r}")
         print(f"[INTENT]   known_info   = {result.get('known_info')}")
@@ -744,6 +795,13 @@ def _build_enriched_query(translated_query: str, known_info: dict) -> str:
     return "，".join(parts)
 
 
+_QUESTION_MARKERS = ("?", "？", "嗎", "如何", "怎麼", "是否", "可否", "可以", "能否", "為何", "什麼", "多少")
+
+
+def _looks_like_question(text: str) -> bool:
+    return any(k in text for k in _QUESTION_MARKERS) and len(text) > SKIP_MAX_LEN
+
+
 def _handle_prompt(prompt: str, persona: str, lang: str) -> str | Iterator[str]:
     """Route a user prompt through intent detection + optional follow-up + RAG.
 
@@ -753,6 +811,8 @@ def _handle_prompt(prompt: str, persona: str, lang: str) -> str | Iterator[str]:
     print(f"[INTENT] ── _handle_prompt ──────────────────────────────")
     print(f"[INTENT] ENABLE_INTENT_DETECTION = {ENABLE_INTENT_DETECTION}")
     print(f"[INTENT] 使用者問句: {prompt!r}")
+    msgs = st.session_state.messages
+    history = msgs[:-1] if msgs and msgs[-1].get("role") == "user" else list(msgs)
 
     def _is_skip(text: str) -> bool:
         return (
@@ -762,7 +822,7 @@ def _handle_prompt(prompt: str, persona: str, lang: str) -> str | Iterator[str]:
 
     def _new_question(qprompt: str) -> str:
         """Handle a fresh (non-mid-dialog) question."""
-        analysis = _analyze_intent(qprompt, {}, lang)
+        analysis = _analyze_intent(qprompt, {}, lang, history)
         if (
             analysis
             and analysis.get("intent") == "solve_problem"
@@ -788,14 +848,14 @@ def _handle_prompt(prompt: str, persona: str, lang: str) -> str | Iterator[str]:
             print(f"[INTENT] 分支: 直接 RAG | intent={intent!r} laws={laws} "
                   f"scenario={(analysis or {}).get('scenario')!r}")
             terms = (analysis or {}).get("search_terms") or []
-            return query_rag_system(qprompt, persona, lang, search_query_override=sq,
+            return query_rag_system(qprompt, persona, lang, search_query_override=sq, history=history,
                                     intent=intent, laws=laws,
                                     search_terms=[x for x in terms if isinstance(x, str)])
 
     if not ENABLE_INTENT_DETECTION:
         intent, laws = heuristic_intent(prompt), detect_laws(prompt)
         print(f"[INTENT] 功能關閉 → 關鍵字分類 intent={intent!r} laws={laws}")
-        return query_rag_system(prompt, persona, lang, intent=intent, laws=laws)
+        return query_rag_system(prompt, persona, lang, intent=intent, laws=laws, history=history)
 
     ctx = st.session_state.intent_ctx
     print(f"[INTENT] intent_ctx = {'有進行中對話' if ctx else '無 (新問題)'}")
@@ -808,7 +868,7 @@ def _handle_prompt(prompt: str, persona: str, lang: str) -> str | Iterator[str]:
             st.session_state.followup_count = 0
             return query_rag_system(
                 ctx["original_query"], persona, lang,
-                search_query_override=ctx["translated_query"],
+                search_query_override=ctx["translated_query"], history=history,
             )
 
         result = _extract_overtime_fields(prompt, ctx["known_info"], lang)
@@ -819,9 +879,16 @@ def _handle_prompt(prompt: str, persona: str, lang: str) -> str | Iterator[str]:
             st.session_state.followup_count = 0
             return query_rag_system(
                 ctx["original_query"], persona, lang,
-                search_query_override=ctx["translated_query"],
+                search_query_override=ctx["translated_query"], history=history,
             )
 
+        gained = any(v is not None and ctx["known_info"].get(k) != v
+                     for k, v in (result.get("known_info") or {}).items())
+        if not result.get("is_new_question") and not gained and _looks_like_question(prompt):
+            # The extractor sometimes calls an unrelated question an answer
+            # (e.g. 「預告工資以何薪資為基準？」 during an overtime follow-up).
+            print("[INTENT] 未取得任何欄位且訊息是問句 → 視為新問題")
+            result["is_new_question"] = True
         if result.get("is_new_question"):
             print("[INTENT] 分支: is_new_question=True → 清空 ctx，重新分析新問題")
             st.session_state.intent_ctx = None
@@ -848,6 +915,7 @@ def _handle_prompt(prompt: str, persona: str, lang: str) -> str | Iterator[str]:
             enriched, persona, lang,
             search_query_override=enriched,
             missing_fields=missing or None,
+            history=history,
         )
 
     else:
@@ -876,6 +944,7 @@ def query_rag_system(
     intent: str = "solve_problem",
     laws: list[str] | None = None,
     search_terms: list[str] | None = None,
+    history: list | None = None,
 ) -> str | Iterator[str]:
     """Run retrieval eagerly, then return a generator that streams the answer.
 
@@ -888,7 +957,10 @@ def query_rag_system(
 
     search_terms: statutory wording from _analyze_intent, appended to the law
         search query (vector + BM25). Bridges colloquial questions to the
-        article text: Hit@5 73% → 80% on the 台北 FAQ set (eval_retrieval.py).
+        article text: Hit@5 73% → 78% mean (76-78% over 5 sampled runs) on the 台北 FAQ set (eval_retrieval.py).
+    history: earlier chat messages; the last few turns go into the answer
+        call so follow-ups stay consistent (retrieval uses the rewritten
+        standalone query from _analyze_intent instead).
     search_query_override: pre-translated Chinese query from _analyze_intent;
         if provided, the internal translation call is skipped.
     missing_fields: list of required field names that were not collected;
@@ -1020,7 +1092,8 @@ def query_rag_system(
                     model=CLAUDE_MODEL,
                     max_tokens=2048,
                     system=system_prompt,
-                    messages=[{"role": "user", "content": final_prompt}],
+                    messages=[*_history_messages(history),
+                              {"role": "user", "content": final_prompt}],
                 ) as stream:
                     for text_chunk in stream.text_stream:
                         if text_chunk:

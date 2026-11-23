@@ -1,5 +1,7 @@
 # Fixed referral / disclaimer text appended after every RAG answer.
-# TODO items: verify all phone numbers and URLs on official websites before publishing.
+# Verified 2026-11: 1955 (勞動部, 24h, toll-free); 法扶 412-8518 (mobile: 02-412-8518)
+# and https://www.laf.org.tw/ ; 勞動部 https://www.mol.gov.tw/ ;
+# 臺北市勞動局 https://bola.gov.taipei/ . Re-check before changing.
 
 REFERRAL_BLOCK = """
 
@@ -7,12 +9,8 @@ REFERRAL_BLOCK = """
 > ⚠️ **本回答僅供參考，不構成法律意見。**
 >
 > 如需進一步諮詢，可洽以下管道：
-> - **1955 勞工諮詢專線**：📞 **1955**（TODO：24小時全年無休，完全免費）
-> - **勞動部**：🌐 TODO：https://www.mol.gov.tw/
-> - **各縣市勞工局／勞動局**：🌐 TODO：台北勞動局 : https://bola.gov.taipei/
-新北市勞工局 : https://www.ntpc.gov.tw/ch/home.jsp?id=1cc8be79ad8046ae
-> - **法律扶助基金會**：📞 TODO：電話 0809090999 🌐 TODO：https://0809090999.com.tw/
+> - **1955 勞工諮詢申訴專線**：📞 **1955**（24 小時全年無休，免付費）
+> - **勞動部**：🌐 https://www.mol.gov.tw/
+> - **各縣市政府勞工局（處）**：可申請勞資爭議調解或檢舉違法（例：臺北市勞動局 🌐 https://bola.gov.taipei/ ）
+> - **法律扶助基金會**：📞 **412-8518**（手機請加 02）🌐 https://www.laf.org.tw/
 """
-
-# Prepended before REFERRAL_BLOCK when the topic falls outside labor law scope.
-OUT_OF_SCOPE_NOTE = "\n> ⚠️ **此問題超出本系統範圍**（本系統僅涵蓋台灣勞動基準法及相關施行細則）。\n"

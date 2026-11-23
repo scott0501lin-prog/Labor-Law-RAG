@@ -918,7 +918,7 @@ def query_rag_system(
 
     search_terms: statutory wording from _analyze_intent, appended to the law
         search query (vector + BM25). Bridges colloquial questions to the
-        article text: Hit@5 73% → 75% mean (74-77% over 5 sampled runs) on the 台北 FAQ set (eval_retrieval.py).
+        article text: Hit@5 73% → 77% mean (74-80% over 10 sampled runs) on the 台北 FAQ set (eval_retrieval.py).
     history: earlier chat messages; the last few turns go into the answer
         call so follow-ups stay consistent (retrieval uses the rewritten
         standalone query from _analyze_intent instead).

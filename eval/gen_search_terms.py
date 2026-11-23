@@ -3,7 +3,7 @@ Run the app's intent prompt over the 台北 FAQ test questions and save the
 search_terms it returns, so eval_retrieval.py can score the "+terms" system
 without calling Claude.
 
-    python eval/gen_search_terms.py            # 5 runs x 93 short Haiku calls
+    python eval/gen_search_terms.py            # 5 runs x 93 short Haiku calls (cached file has 10)
     python eval/gen_search_terms.py --runs 3
 
 Output: eval/taipei_search_terms.json  {question: [[term, ...] per run]}

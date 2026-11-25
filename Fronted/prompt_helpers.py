@@ -68,94 +68,21 @@ _ANSWER = re.compile(r"<answer>(.*?)</answer>", re.S | re.I)
 
 
 def parse_reply(text: str):
-    """回傳 (scope, body)。解析失敗時一律視為 IN，並盡量只回傳可讀內容，避免誤殺。"""
-    m = _SCOPE.search(text)
-    scope = m.group(1).upper() if m else "IN"
-    a = _ANSWER.search(text)
-    if a:
-        body = a.group(1).strip()
-    else:
-        body = _SCOPE.sub("", text)
-        body = re.sub(r"</?answer>", "", body, flags=re.I).strip()
-    return scope, body
+    """Strictly require a complete, single response envelope."""
+    m = re.fullmatch(r"\s*<scope>\s*(IN|OUT)\s*</scope>\s*<answer>(.*?)</answer>\s*", text, re.S | re.I)
+    if not m or re.search(r"</?(?:scope|answer)\b", m.group(2), re.I):
+        return "OUT", ""
+    return m.group(1).upper(), m.group(2).strip()
 
 
 def finalize_reply(raw_text: str) -> str:
-    """app.py 在取得 Gemini 回應後呼叫：OUT 換成固定轉介文字，IN 回傳乾淨的回答內容。"""
     scope, body = parse_reply(raw_text)
-    return OUT_OF_SCOPE_TEXT if scope == "OUT" else body
-
-
-# 串流版：等 <scope> 出現後才開始輸出，超過這個長度還沒看到就視為 IN
-_SCOPE_WAIT_CHARS = 300
-_OPEN, _CLOSE = "<answer>", "</answer>"
+    return OUT_OF_SCOPE_TEXT if scope == "OUT" or not body else body
 
 
 def stream_reply(pieces: Iterable[str]) -> Iterator[str]:
-    """finalize_reply 的串流版：邊收邊輸出 <answer> 內文。
-
-    OUT 時只輸出 OUT_OF_SCOPE_TEXT，但仍會把 pieces 讀完（讓上游能記錄 token 用量）。
-    解析失敗一律視為 IN，與 parse_reply 相同。
-    """
-    it = iter(pieces)
-    buf = ""
-    for piece in it:
-        buf += piece
-        if _SCOPE.search(buf) or len(buf) > _SCOPE_WAIT_CHARS:
-            break
-
-    m = _SCOPE.search(buf)
-    if m and m.group(1).upper() == "OUT":
+    # Legacy research utility only. Never stream an incomplete envelope.
+    try:
+        yield finalize_reply("".join(pieces))
+    except Exception:
         yield OUT_OF_SCOPE_TEXT
-        for _ in it:
-            pass
-        return
-
-    pending = _SCOPE.sub("", buf)
-    state = "pre"  # pre → body → post
-    started = False
-
-    def _emit(text: str):
-        nonlocal started
-        if not started:
-            text = text.lstrip()
-            started = bool(text)
-        return text
-
-    def _process() -> Iterator[str]:
-        nonlocal pending, state
-        if state == "pre":
-            idx = pending.lower().find(_OPEN)
-            if idx != -1:
-                pending = pending[idx + len(_OPEN):]
-                state = "body"
-            else:
-                head = pending.lstrip()
-                if head and not _OPEN.startswith(head[:len(_OPEN)].lower()):
-                    state = "body"  # 沒有 <answer> 標籤：直接當內文輸出
-        if state == "body":
-            idx = pending.lower().find(_CLOSE)
-            if idx != -1:
-                out, pending, state = pending[:idx], "", "post"
-            else:
-                # 保留尾端可能是被切開的 </answer>
-                k = pending.rfind("<")
-                if k != -1 and _CLOSE.startswith(pending[k:].lower()):
-                    out, pending = pending[:k], pending[k:]
-                else:
-                    out, pending = pending, ""
-            out = _emit(out)
-            if out:
-                yield out
-        if state == "post":
-            pending = ""
-
-    yield from _process()
-    for piece in it:
-        pending += piece
-        yield from _process()
-
-    if pending and state != "post":
-        tail = _emit(re.sub(r"</?answer>", "", pending, flags=re.I))
-        if tail:
-            yield tail

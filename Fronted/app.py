@@ -43,9 +43,9 @@ load_dotenv(os.path.join(base_dir, ".env"))
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "chroma").lower()
+VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "numpy").lower()
 
-EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3").lower()
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text2vec").lower()
 if "text2vec" in EMBED_MODEL:
     _MODEL_NAME    = "shibing624/text2vec-base-chinese"
     _MODEL_SUFFIX  = ""
@@ -94,7 +94,16 @@ _CHROMA_DB_PATH = _resolve_chroma_path()
 # ==========================================
 # 1. 系統初始化
 # ==========================================
-init_indexes()
+@st.cache_resource(show_spinner=False)
+def _init_db_once():
+    init_indexes()
+    return True
+
+try:
+    _init_db_once()
+except Exception:
+    st.error("資料庫連線失敗，請確認 MONGO_URI、MongoDB Atlas 網路存取設定及帳號權限。")
+    st.stop()
 
 defaults = {
     "session_id": str(uuid.uuid4()),
@@ -109,6 +118,7 @@ defaults = {
     # intent-detection state (reset when a complete RAG answer is given)
     "intent_ctx": None,    # dict with original_query/translated_query/scenario/known_info
     "followup_count": 0,   # number of follow-up rounds completed in current dialog
+    "_case_query": None,
     "_pending_cases": None,  # list[(text, meta, score)] from last RAG query; shown on button click
     "_show_cases": False,    # whether the case panel is expanded
 }
@@ -573,7 +583,7 @@ def _search(model, query, embeddings, texts, metas, top_k=5, _top_k_chunks=20):
     # 以 parent_id 合併：同一份文件只保留分數最高的那塊
     seen = {}
     for i in top_idx:
-        pid = metas[i].get("parent_id", str(i))
+        pid = (metas[i].get("source"), metas[i].get("article_no")) if metas[i].get("article_no") else metas[i].get("parent_id", str(i))
         if pid not in seen or scores[i] > seen[pid][1]:
             seen[pid] = (i, float(scores[i]))
 
@@ -597,7 +607,7 @@ def _chroma_search(model, collection, query, top_k=5, _top_k_chunks=20):
     seen = {}  # parent_id → (text, meta, score)
     for doc, raw_meta, dist in zip(docs, metas_raw, distances):
         score = 1.0 - dist
-        pid   = raw_meta.get("parent_id", "")
+        pid = (raw_meta.get("source"), raw_meta.get("article_no")) if raw_meta.get("article_no") else raw_meta.get("parent_id", doc)
         if pid not in seen or score > seen[pid][2]:
             meta = dict(raw_meta)
             meta["display_text"] = doc       # restore display_text stored in documents
@@ -620,6 +630,7 @@ from force_rules import (
 )
 from referral_text import REFERRAL_BLOCK
 from labor_calculator import calculate_overtime
+from verified_rag import answer as verified_answer, direct_ids, search_cases, MODEL as VERIFIED_MODEL, REFUSAL
 from prompt_helpers import (
     OUT_OF_SCOPE_TEXT,
     build_system_prompt,
@@ -638,14 +649,14 @@ import re as _re
 
 # Retry only when the stream fails before any text was shown to the user
 CLAUDE_MAX_ATTEMPTS = 2
-CLAUDE_MODEL = "claude-haiku-5-5"
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", VERIFIED_MODEL)
 
 
 @st.cache_resource
 def _get_anthropic_client(api_key: str):
     """Shared Anthropic client — cached to avoid repeated TLS setup."""
     import anthropic as _ant
-    return _ant.Anthropic(api_key=api_key)
+    return _ant.Anthropic(api_key=api_key, timeout=15.0, max_retries=0)
 
 
 def _claude_json_call(prompt_text: str, _label: str = "intent") -> dict | None:
@@ -740,328 +751,42 @@ def _build_enriched_query(translated_query: str, known_info: dict) -> str:
     return "，".join(parts)
 
 
-def _handle_prompt(prompt: str, persona: str, lang: str) -> str | Iterator[str]:
-    """Route a user prompt through intent detection + optional follow-up + RAG.
-
-    Falls back to query_rag_system() directly whenever intent detection is
-    disabled, JSON parsing fails, or the scenario is not overtime_pay.
-    """
-    print(f"[INTENT] ── _handle_prompt ──────────────────────────────")
-    print(f"[INTENT] ENABLE_INTENT_DETECTION = {ENABLE_INTENT_DETECTION}")
-    print(f"[INTENT] 使用者問句: {prompt!r}")
-
-    def _is_skip(text: str) -> bool:
-        return (
-            len(text) <= SKIP_MAX_LEN
-            and any(kw in text for kw in SKIP_FOLLOWUP_TRIGGERS)
-        )
-
-    def _new_question(qprompt: str) -> str:
-        """Handle a fresh (non-mid-dialog) question."""
-        analysis = _analyze_intent(qprompt, {}, lang)
-        if (
-            analysis
-            and analysis.get("intent") == "solve_problem"
-            and analysis.get("scenario") == "overtime_pay"
-            and analysis.get("missing_fields")
-            and not _is_skip(qprompt)
-        ):
-            print(f"[INTENT] 分支: 追問 | follow_up={analysis.get('follow_up')!r}")
-            st.session_state.intent_ctx = {
-                "original_query":   qprompt,
-                "translated_query": analysis.get("translated_query") or qprompt,
-                "scenario":         "overtime_pay",
-                "known_info":       analysis.get("known_info") or {},
-            }
-            st.session_state.followup_count = 0
-            return analysis.get("follow_up") or ""
-        else:
-            reason = "解析失敗" if not analysis else f"intent={analysis.get('intent')!r} scenario={analysis.get('scenario')!r}"
-            print(f"[INTENT] 分支: 直接 RAG | {reason}")
-            sq = analysis.get("translated_query") if analysis else None
-            return query_rag_system(qprompt, persona, lang, search_query_override=sq)
-
-    if not ENABLE_INTENT_DETECTION:
-        print("[INTENT] 未執行: 功能關閉 (ENABLE_INTENT_DETECTION=False) → 直接 RAG")
-        return query_rag_system(prompt, persona, lang)
-
-    ctx = st.session_state.intent_ctx
-    print(f"[INTENT] intent_ctx = {'有進行中對話' if ctx else '無 (新問題)'}")
-
-    if ctx is not None:
-        # ── Mid-dialog: processing a follow-up answer ─────────────────────
-        if _is_skip(prompt):
-            print(f"[INTENT] 分支: mid-dialog 跳過 → 直接 RAG (原問句)")
-            st.session_state.intent_ctx = None
-            st.session_state.followup_count = 0
-            return query_rag_system(
-                ctx["original_query"], persona, lang,
-                search_query_override=ctx["translated_query"],
-            )
-
-        result = _extract_overtime_fields(prompt, ctx["known_info"], lang)
-        if result is None:
-            # JSON failure → fallback with what we have
-            print("[INTENT] 分支: extraction 解析失敗 → fallback RAG (原問句)")
-            st.session_state.intent_ctx = None
-            st.session_state.followup_count = 0
-            return query_rag_system(
-                ctx["original_query"], persona, lang,
-                search_query_override=ctx["translated_query"],
-            )
-
-        if result.get("is_new_question"):
-            print("[INTENT] 分支: is_new_question=True → 清空 ctx，重新分析新問題")
-            st.session_state.intent_ctx = None
-            st.session_state.followup_count = 0
-            return _new_question(prompt)
-
-        # Merge new non-null values into known_info
-        for k, v in (result.get("known_info") or {}).items():
-            if v is not None:
-                ctx["known_info"][k] = v
-        st.session_state.followup_count += 1
-        missing = result.get("missing_fields") or []
-
-        if missing and st.session_state.followup_count < MAX_FOLLOWUP_ROUNDS:
-            print(f"[INTENT] 分支: 繼續追問 (round={st.session_state.followup_count}) | missing={missing}")
-            return result.get("follow_up") or ""
-
-        # Reached limit or all fields collected → proceed to RAG
-        enriched = _build_enriched_query(ctx["translated_query"], ctx["known_info"])
-        print(f"[INTENT] 分支: 追問完成 → RAG | enriched={enriched!r} | missing={missing or None}")
-        st.session_state.intent_ctx = None
-        st.session_state.followup_count = 0
-        return query_rag_system(
-            enriched, persona, lang,
-            search_query_override=enriched,
-            missing_fields=missing or None,
-        )
-
-    else:
-        return _new_question(prompt)
+def _handle_prompt(prompt: str, persona: str, lang: str) -> str:
+    """Strict evidence-only route. Never stream unverified AI legal prose."""
+    return query_rag_system(prompt, persona, lang)
 
 
-# ==========================================
-# 4. 後端 RAG 引擎 (Gemini + Numpy 搜尋)
-# ==========================================
-_rag_logger = logging.getLogger("rag_timing")
-if not _rag_logger.handlers:
-    _rag_log_path = os.path.join(base_dir, "rag_timing.log")
-    _rag_handler = logging.FileHandler(_rag_log_path, encoding="utf-8")
-    _rag_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-    _rag_logger.addHandler(_rag_handler)
-    _rag_logger.setLevel(logging.INFO)
-
-
-def query_rag_system(
-    user_prompt: str,
-    system_prompt: str,
-    ui_lang: str,
-    *,
-    search_query_override: str | None = None,
-    missing_fields: list[str] | None = None,
-) -> str | Iterator[str]:
-    """Run retrieval eagerly, then return a generator that streams the answer.
-
-    Returns a plain string for early errors (missing API key, retrieval failure).
-
-    search_query_override: pre-translated Chinese query from _analyze_intent;
-        if provided, the internal translation call is skipped.
-    missing_fields: list of required field names that were not collected;
-        if non-empty, a disclaimer is appended to final_prompt asking Gemini
-        NOT to assume values.
-    """
-    try:
-        api_key = ANTHROPIC_API_KEY or os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            return t(ui_lang, "err_no_api_key")
-
-        _t0 = time.perf_counter()
-        client = _get_anthropic_client(api_key)
-
-        _use_chroma = VECTOR_BACKEND == "chroma"
-        if _use_chroma:
-            _chroma_res = _load_chroma_index()
-            if _chroma_res is None:
-                _use_chroma = False  # fallback: chroma failed both times
-            else:
-                model, law_col, cases_col, law_texts, law_metas, case_texts, case_metas = _chroma_res
-        if not _use_chroma:
-            model, law_emb, law_texts, law_metas, case_emb, case_texts, case_metas = _load_index()
-        _t_load = time.perf_counter()
-
-        def _is_chinese(text: str) -> bool:
-            chinese_chars = sum(1 for c in text if "一" <= c <= "鿿")
-            return chinese_chars / max(len(text), 1) >= 0.3
-
-        if search_query_override is not None:
-            # Translation already done by _analyze_intent — skip the extra call
-            search_query = search_query_override
-        else:
-            search_query = user_prompt
-            if not _is_chinese(user_prompt):
-                try:
-                    search_query = client.messages.create(
-                        model=CLAUDE_MODEL,
-                        max_tokens=256,
-                        messages=[{"role": "user", "content": f"請將以下使用者問題翻譯成繁體中文，只需要輸出翻譯結果，不要加任何說明：\n\n{user_prompt}"}],
-                    ).content[0].text.strip()
-                except Exception:
-                    search_query = user_prompt
-        _t_trans = time.perf_counter()
-
-        if _use_chroma:
-            l_results = _chroma_search(model, law_col, search_query, top_k=5)
-        else:
-            l_results = _search(model, search_query, law_emb, law_texts, law_metas, top_k=5)
-        _t_law_search = time.perf_counter()
-
-        fired_mutex: set = set()
-        for rule in FORCE_ARTICLE_RULES:
-            if rule["mutex"] and rule["mutex"] in fired_mutex:
-                continue
-            if any(k in search_query for k in rule["keywords"]):
-                l_results = _force_include_articles(
-                    search_query, l_results, law_texts, law_metas,
-                    rule["keywords"], rule["articles"]
-                )
-                if rule["mutex"]:
-                    fired_mutex.add(rule["mutex"])
-        l_results = l_results[:MAX_FORCED_LAW_RESULTS]
-        _t_force_l = time.perf_counter()
-
-        if _use_chroma:
-            c_results = _chroma_search(model, cases_col, search_query, top_k=5)
-        else:
-            c_results = _search(model, search_query, case_emb, case_texts, case_metas, top_k=5)
-        _t_case_search = time.perf_counter()
-
-        _overtime_kw = next(r["keywords"] for r in FORCE_ARTICLE_RULES if r["name"] == "加班延長工時")
-        c_results = _force_include_cases(
-            search_query, c_results, case_texts, case_metas, _overtime_kw, RESTDAY_OVERTIME_FORCE_TITLES
-        )
-        _t_force_c = time.perf_counter()
-
-        law_ctx = ""
-        official_law_codes = {
-            "勞動基準法": "N0030001",
-            "勞動基準法施行細則": "N0030002",
-        }
-        for d, m, score in l_results:
-            display = m.get("display_text", d)
-            law_name = str(m.get("source", "") or "").strip()
-            article_no = str(m.get("article_no", "") or "").strip()
-            law_code = official_law_codes.get(law_name)
-            official_url = (
-                f"https://law.moj.gov.tw/LawClass/LawAll.aspx?pcode={law_code}"
-                if law_code else ""
-            )
-            law_ctx += (
-                f"【法規名稱】：{law_name}\\n"
-                f"【條號】：{article_no}\\n"
-                f"【法規內容】：{display}\\n"
-                f"【官方法規查詢】：{official_url or '來源未提供，請勿自行編造連結'}\\n\\n"
-            )
-
-        # c_results are saved to session_state for the "查看相似案例" button;
-        # they are NOT included in the Gemini prompt (saves tokens).
-        st.session_state["_pending_cases"] = c_results
-        st.session_state["_show_cases"]    = False
-
-        # 回答語言邏輯：永遠跟著 UI 語言選項走。
-        lang_rule = build_lang_rule(ui_lang, LANGUAGES.get(ui_lang, "Traditional Chinese"))
-
-        # Missing-fields disclaimer — only appended when fields were still absent
-        # after the follow-up dialog, so Gemini won't invent numbers.
-        labels = "、".join(MISSING_FIELDS_LABELS.get(f, f) for f in (missing_fields or []))
-        missing_note = build_missing_note(labels)
-
-        final_prompt = build_user_prompt(law_ctx, user_prompt, lang_rule, missing_note)
-        _t_prompt = time.perf_counter()
-
-    except Exception as e:
-        return f"🚨 異常：{str(e)}"
-
-    _stats = {"t_first": None, "usage": None, "retries": 0}
-
-    def _raw() -> Iterator[str]:
-        """Yield raw Claude text chunks, recording first-token time and usage.
-
-        Retries a failed/timed-out request only if no text was yielded yet;
-        once the user has seen part of the answer, the error is re-raised.
-        """
-        for attempt in range(1, CLAUDE_MAX_ATTEMPTS + 1):
-            emitted = False
+def query_rag_system(user_prompt: str, system_prompt: str, ui_lang: str, **_unused) -> str:
+    started = time.perf_counter()
+    st.session_state["_pending_cases"] = None
+    st.session_state["_case_query"] = None
+    st.session_state["_show_cases"] = False
+    api_key = ANTHROPIC_API_KEY or os.getenv("ANTHROPIC_API_KEY")
+    client = None
+    semantic_keys = []
+    if direct_ids(user_prompt) is None:
+        if api_key:
             try:
-                with client.messages.stream(
-                    model=CLAUDE_MODEL,
-                    max_tokens=2048,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": final_prompt}],
-                ) as stream:
-                    for text_chunk in stream.text_stream:
-                        if text_chunk:
-                            if _stats["t_first"] is None:
-                                _stats["t_first"] = time.perf_counter()
-                            emitted = True
-                            yield text_chunk
-                    final_msg = stream.get_final_message()
-                    if final_msg:
-                        _stats["usage"] = final_msg.usage
-                return
-            except Exception as e:
-                if emitted or attempt == CLAUDE_MAX_ATTEMPTS:
-                    raise
-                _stats["retries"] += 1
-                print(f"[CLAUDE] 第 {attempt} 次呼叫失敗，重試：{e}", flush=True)
-
-    def _stream() -> Iterator[str]:
-        """Stream the <answer> body; OUT scope gets the fixed referral text instead."""
-        is_out = False
-        try:
-            for piece in stream_reply(_raw()):
-                # stream_reply yields the OUT_OF_SCOPE_TEXT object itself for OUT scope
-                is_out = is_out or piece is OUT_OF_SCOPE_TEXT
-                yield piece
-        except Exception as e:
-            _rag_logger.info(
-                f"q={user_prompt[:25]!r} ERROR after {time.perf_counter()-_t_prompt:.3f}s "
-                f"retries={_stats['retries']} shown={_stats['t_first'] is not None} err={e!r}"
-            )
-            yield f"\n\n🚨 回答中斷（{type(e).__name__}），請再問一次。"
-            return
-
-        _t_claude = time.perf_counter()
-        _t_first  = _stats["t_first"]
-        _usage    = _stats["usage"]
-
-        # Token usage (Anthropic SDK: usage.input_tokens / output_tokens)
-        _input_tok  = int(getattr(_usage, "input_tokens",  0) or 0)
-        _output_tok = int(getattr(_usage, "output_tokens", 0) or 0)
-
-        _rag_logger.info(
-            f"q={user_prompt[:25]!r} zh={_is_chinese(user_prompt)} "
-            f"load={_t_load-_t0:.3f}s "
-            f"trans={_t_trans-_t_load:.3f}s "
-            f"law_search={_t_law_search-_t_trans:.3f}s "
-            f"force_l={_t_force_l-_t_law_search:.3f}s "
-            f"case_search={_t_case_search-_t_force_l:.3f}s "
-            f"force_c={_t_force_c-_t_case_search:.3f}s "
-            f"prompt={_t_prompt-_t_force_c:.3f}s "
-            f"ttft={(_t_first or _t_claude)-_t_prompt:.3f}s "
-            f"claude={_t_claude-_t_prompt:.3f}s "
-            f"total={_t_claude-_t0:.3f}s "
-            f"prompt_chars={len(final_prompt)} "
-            f"input_tok={_input_tok} output_tok={_output_tok} "
-            f"scope={'OUT' if is_out else 'IN'} retries={_stats['retries']}"
-        )
-
-        # OUT_OF_SCOPE_TEXT already lists referral channels
-        if not is_out:
-            yield REFERRAL_BLOCK
-
-    return _stream()
+                client = _get_anthropic_client(api_key)
+            except Exception:
+                pass
+        # Optional semantic retrieval, disabled by default to avoid heavy cold start.
+        if os.getenv("RAG_SEMANTIC", "false").lower() == "true":
+            try:
+                from verified_rag import number, FILES
+                model, law_emb, law_texts, law_metas, *_ = _load_index()
+                for _, meta, _ in _search(model, user_prompt, law_emb, law_texts, law_metas, top_k=12, _top_k_chunks=60):
+                    if meta.get("source") in FILES:
+                        semantic_keys.append(FILES[meta["source"]][0]+":"+number(meta["article_no"]))
+            except Exception as exc:
+                logging.getLogger("verified_rag").warning("optional semantic retrieval unavailable: %s", type(exc).__name__)
+    result = verified_answer(user_prompt, ui_lang, client, CLAUDE_MODEL,
+                             semantic_keys=semantic_keys,
+                             online=os.getenv("VERIFY_OFFICIAL", "true").lower() == "true")
+    if "### 法規查詢結果" in result:
+        st.session_state["_case_query"] = user_prompt
+    logging.getLogger("verified_rag").info("answer elapsed=%.3fs", time.perf_counter()-started)
+    return result
 
 
 # ==========================================
@@ -1214,7 +939,7 @@ def show_landing_page():
 def _render_case_results(c_results: list, lang: str) -> None:
     """Render similar-case cards below the answer. Called only when user clicks the button."""
     st.markdown("---")
-    st.markdown("**🔍 相似案例** *(案例僅供參考，每件情況不同)*")
+    st.markdown("**🔍 相關案例與參考資料** *(本地資料未即時核對；包括函釋、問答及裁判書，不一定是裁罰案例)*")
     if not c_results:
         st.info("未找到相似案例。")
         return
@@ -1233,17 +958,18 @@ def _render_case_results(c_results: list, lang: str) -> None:
             metadata_labels = [
                 ("地區", ("city", "county", "location")),
                 ("違規法條", ("article_no", "law_article", "violation_article")),
-                ("裁罰日期", ("date", "penalty_date")),
+                ("裁罰日期", ("penalty_date",)),
+                ("資料日期", ("date",)),
                 ("裁罰金額", ("fine", "fine_amount", "penalty_amount")),
             ]
             for label, keys in metadata_labels:
                 value = next((meta.get(key) for key in keys if meta.get(key) not in (None, "")), None)
                 if value is not None:
                     st.markdown(f"**{label}**：{value}")
-            st.markdown(summary)
-            if url:
+            st.text(summary)
+            if url and url.startswith("https://"):
                 st.markdown(f"[🔗 查看原文]({url})")
-            st.caption(f"檢索相似度：{score:.3f}（僅供排序參考，非違法認定）")
+            st.caption("本地案例資料未即時核對；BM25 排序分數不是正確率或違法認定。")
 
 
 # ==========================================
@@ -1299,6 +1025,7 @@ def show_chat_room():
             st.session_state.messages        = []
             st.session_state.current_chat_id = None
             st.session_state["_pending_cases"] = None
+            st.session_state["_case_query"] = None
             st.session_state["_show_cases"]    = False
             st.rerun()
 
@@ -1307,6 +1034,7 @@ def show_chat_room():
             st.session_state.messages        = []
             st.session_state.current_chat_id = None
             st.session_state["_pending_cases"] = None
+            st.session_state["_case_query"] = None
             st.session_state["_show_cases"]    = False
             st.rerun()
 
@@ -1314,6 +1042,7 @@ def show_chat_room():
             for k in ["logged_in", "username", "user_role", "messages", "current_chat_id"]:
                 st.session_state[k] = defaults[k]
             st.session_state["_pending_cases"] = None
+            st.session_state["_case_query"] = None
             st.session_state["_show_cases"]    = False
             st.session_state.page = "Login"
             st.rerun()
@@ -1353,6 +1082,9 @@ def show_chat_room():
                 if st.button(label, key=cid, help=time_str, use_container_width=True):
                     st.session_state.messages        = load_chat(st.session_state.username, cid)
                     st.session_state.current_chat_id = cid
+                    st.session_state["_case_query"] = None
+                    st.session_state["_pending_cases"] = None
+                    st.session_state["_show_cases"] = False
                     st.rerun()
 
     # --- 主聊天區 ---
@@ -1379,7 +1111,7 @@ def show_chat_room():
             )
         with calc_col2:
             calc_hours = st.number_input(
-                "加班時數", min_value=0.5, max_value=12.0, value=2.0, step=0.5,
+                "加班時數（平日最多 4 小時）", min_value=0.5, max_value=12.0, value=2.0, step=0.5,
                 key="overtime_calc_hours"
             )
         with calc_col3:
@@ -1389,26 +1121,28 @@ def show_chat_room():
         if st.button("計算加班費", key="overtime_calc_submit"):
             try:
                 calc_result = calculate_overtime(calc_wage, calc_hours, calc_day_type)
-                st.success(f"估算加班費：NT$ {calc_result['total']:,.0f}")
+                st.success(f"估算加班費：NT$ {calc_result['total']:,.2f}")
                 st.write(f"每小時工資額：NT$ {calc_result['hourly_wage']:,.2f}")
                 for item in calc_result["breakdown"]:
                     st.write(
                         f"- {item['label']}：{item['hours']:g} 小時 × "
-                        f"{item['multiplier']:.3g} 倍 = NT$ {item['amount']:,.0f}"
+                        f"{item['fraction']} 倍 = NT$ {item['amount']:,.2f}"
                     )
+                st.markdown("[勞動部月薪制加班費試算](https://calcr2.mol.gov.tw/Monthly)")
                 st.warning(
-                    "這是一般情境的估算，不是正式工資核算或法律認定。"
+                    "公式未即時核對現行法規。這是一般情境的估算，不是正式工資核算或法律認定。"
                     "請確認工資是否包含應計入的經常性給與、實際出勤時數及適用工時制度。"
                 )
             except ValueError as exc:
                 st.error(str(exc))
 
+    st.caption("嚴格證據模式：法規原文經本地比對，另標示官方核對狀態；AI 負責挑選證據，不直接判定個案。其他語言仍保留中文法條原文。歷史回答可能來自舊版，請重新查詢。")
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
     # ── 「查看相似案例」按鈕（出現在最後一則 AI 回答之後）──
-    _has_cases = bool(st.session_state.get("_pending_cases"))
+    _has_cases = bool(st.session_state.get("_case_query"))
     _last_is_assistant = (
         bool(st.session_state.messages)
         and st.session_state.messages[-1]["role"] == "assistant"
@@ -1416,6 +1150,11 @@ def show_chat_room():
     if _has_cases and _last_is_assistant:
         if not st.session_state.get("_show_cases"):
             if st.button("🔍 查看相似案例"):
+                with st.spinner("搜尋本地案例資料…"):
+                    try:
+                        st.session_state["_pending_cases"] = search_cases(st.session_state["_case_query"])
+                    except Exception:
+                        st.session_state["_pending_cases"] = []
                 st.session_state["_show_cases"] = True
                 st.rerun()
         else:
@@ -1436,13 +1175,12 @@ def show_chat_room():
         st.session_state.messages.append({"role": "user", "content": prompt})
 
         with st.chat_message("assistant"):
-            # Spinner covers retrieval only; the answer then streams in
+            # Display only after the complete response has been validated.
             with st.spinner(t(lang, "thinking_spinner")):
                 resp = _handle_prompt(prompt, persona, lang)
-            if isinstance(resp, str):
-                st.markdown(resp)
-            else:
-                resp = st.write_stream(resp)
+            st.markdown(resp if isinstance(resp, str) else REFUSAL)
+            if not isinstance(resp, str):
+                resp = REFUSAL
         st.session_state.messages.append({"role": "assistant", "content": resp})
 
         if not st.session_state.current_chat_id:
@@ -1457,14 +1195,7 @@ def show_chat_room():
 # 7. 主程式 — 頁面路由
 # ==========================================
 
-# Pre-load index at startup so the spinner shows immediately instead of on first query.
-# @st.cache_resource ensures this runs only once per process lifetime.
-if VECTOR_BACKEND == "chroma":
-    if _load_chroma_index() is None:
-        st.warning("⚠️ Chroma 索引載入失敗（已嘗試重建），已自動退回 NumPy 路徑。詳情請查看終端機日誌。")
-        _load_index()
-else:
-    _load_index()
+# Lazy retrieval: no embedding or case index is loaded at startup.
 
 inject_css()
 

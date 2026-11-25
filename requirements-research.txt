@@ -1,0 +1,13 @@
+streamlit
+anthropic
+chromadb
+sentence-transformers
+pymongo[srv]
+python-dotenv
+requests
+beautifulsoup4
+playwright
+numpy
+certifi
+pysqlite3-binary; sys_platform == "linux"
+psutil

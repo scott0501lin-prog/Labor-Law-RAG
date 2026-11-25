@@ -619,6 +619,7 @@ from force_rules import (
     _force_include_cases,
 )
 from referral_text import REFERRAL_BLOCK
+from labor_calculator import calculate_overtime
 from prompt_helpers import (
     OUT_OF_SCOPE_TEXT,
     build_system_prompt,
@@ -943,9 +944,25 @@ def query_rag_system(
         _t_force_c = time.perf_counter()
 
         law_ctx = ""
-        for d, m, _ in l_results:
+        official_law_codes = {
+            "勞動基準法": "N0030001",
+            "勞動基準法施行細則": "N0030002",
+        }
+        for d, m, score in l_results:
             display = m.get("display_text", d)
-            law_ctx += f"【法規內容】：{display}\n【條號】：{m.get('source', '')} {m.get('article_no', '')}\n\n"
+            law_name = str(m.get("source", "") or "").strip()
+            article_no = str(m.get("article_no", "") or "").strip()
+            law_code = official_law_codes.get(law_name)
+            official_url = (
+                f"https://law.moj.gov.tw/LawClass/LawAll.aspx?pcode={law_code}"
+                if law_code else ""
+            )
+            law_ctx += (
+                f"【法規名稱】：{law_name}\\n"
+                f"【條號】：{article_no}\\n"
+                f"【法規內容】：{display}\\n"
+                f"【官方法規查詢】：{official_url or '來源未提供，請勿自行編造連結'}\\n\\n"
+            )
 
         # c_results are saved to session_state for the "查看相似案例" button;
         # they are NOT included in the Gemini prompt (saves tokens).
@@ -1206,15 +1223,27 @@ def _render_case_results(c_results: list, lang: str) -> None:
         source   = meta.get("source") or ""
         category = meta.get("category") or ""
         display  = meta.get("display_text", text)
-        summary  = display[:150] + ("…" if len(display) > 150 else "")
+        summary  = display[:450] + ("…" if len(display) > 450 else "")
         url      = meta.get("url") or ""
         header   = title or f"{source} — {category}"
         with st.expander(f"📄 {header}", expanded=False):
             if source or category:
-                st.markdown(f"**類別**：{source}{'  —  ' + category if category else ''}")
+                st.markdown(f"**資料來源／類別**：{source}{'  —  ' + category if category else ''}")
+            # 僅顯示索引資料實際存在的欄位，不推測裁罰資訊。
+            metadata_labels = [
+                ("地區", ("city", "county", "location")),
+                ("違規法條", ("article_no", "law_article", "violation_article")),
+                ("裁罰日期", ("date", "penalty_date")),
+                ("裁罰金額", ("fine", "fine_amount", "penalty_amount")),
+            ]
+            for label, keys in metadata_labels:
+                value = next((meta.get(key) for key in keys if meta.get(key) not in (None, "")), None)
+                if value is not None:
+                    st.markdown(f"**{label}**：{value}")
             st.markdown(summary)
             if url:
                 st.markdown(f"[🔗 查看原文]({url})")
+            st.caption(f"檢索相似度：{score:.3f}（僅供排序參考，非違法認定）")
 
 
 # ==========================================
@@ -1335,6 +1364,44 @@ def show_chat_room():
         f"</div>",
         unsafe_allow_html=True,
     )
+
+    # 加班費概算工具：由程式依級距計算，不讓語言模型自行心算。
+    with st.expander("🧮 加班費快速概算（一般月薪制）", expanded=False):
+        st.caption(
+            "目前支援平日及休息日的一般月薪制概算，依月薪 ÷ 240 換算每小時工資額。"
+            "例假日、國定假日、變形工時、部分工時及特殊工資項目請另行核對。"
+        )
+        calc_col1, calc_col2, calc_col3 = st.columns(3)
+        with calc_col1:
+            calc_wage = st.number_input(
+                "月薪（元）", min_value=1.0, value=36000.0, step=1000.0,
+                key="overtime_calc_monthly_wage"
+            )
+        with calc_col2:
+            calc_hours = st.number_input(
+                "加班時數", min_value=0.5, max_value=12.0, value=2.0, step=0.5,
+                key="overtime_calc_hours"
+            )
+        with calc_col3:
+            calc_day_type = st.selectbox(
+                "加班日類型", ["平日", "休息日"], key="overtime_calc_day_type"
+            )
+        if st.button("計算加班費", key="overtime_calc_submit"):
+            try:
+                calc_result = calculate_overtime(calc_wage, calc_hours, calc_day_type)
+                st.success(f"估算加班費：NT$ {calc_result['total']:,.0f}")
+                st.write(f"每小時工資額：NT$ {calc_result['hourly_wage']:,.2f}")
+                for item in calc_result["breakdown"]:
+                    st.write(
+                        f"- {item['label']}：{item['hours']:g} 小時 × "
+                        f"{item['multiplier']:.3g} 倍 = NT$ {item['amount']:,.0f}"
+                    )
+                st.warning(
+                    "這是一般情境的估算，不是正式工資核算或法律認定。"
+                    "請確認工資是否包含應計入的經常性給與、實際出勤時數及適用工時制度。"
+                )
+            except ValueError as exc:
+                st.error(str(exc))
 
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):

@@ -1,13 +1,17 @@
 """
-Run the app's intent prompt over the 台北 FAQ test questions and save the
+Run the app's intent prompt over the test-set questions and save the
 search_terms it returns, so eval_retrieval.py can score the "+terms" system
 without calling Claude.
 
-    python eval/gen_search_terms.py            # 5 runs x 93 short Haiku calls (cached file has 10)
+    python eval/gen_search_terms.py              # all questions, 5 runs each
     python eval/gen_search_terms.py --runs 3
+    python eval/gen_search_terms.py --missing    # only questions not cached yet,
+                                                 # same run count as the cache
 
-Output: eval/taipei_search_terms.json  {question: [[term, ...] per run]}
-Rerun after changing INTENT_ANALYSIS_PROMPT (Fronted/intent_config.py).
+Input:  the test sets listed in eval_retrieval.TESTSETS
+Output: eval/search_terms.json  {question: [[term, ...] per run]}
+Rerun (without --missing) after changing INTENT_ANALYSIS_PROMPT
+(Fronted/intent_config.py).
 
 Several runs because the terms are sampled (the API takes no temperature on
 current models): a single run's Hit@5 ranged 72%-80% on the same prompt, so
@@ -22,23 +26,39 @@ from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "Fronted"))
+sys.path.insert(0, os.path.join(ROOT, "eval"))
 
 import anthropic  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 from intent_config import INTENT_ANALYSIS_PROMPT  # noqa: E402
+from eval_retrieval import TESTSETS, load_testset  # noqa: E402
 
 MODEL = "claude-haiku-5-5"  # same as app.CLAUDE_MODEL
-OUT = os.path.join(ROOT, "eval", "taipei_search_terms.json")
+OUT = os.path.join(ROOT, "eval", "search_terms.json")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", type=int, default=5)
+    ap.add_argument("--missing", action="store_true",
+                    help="keep the cache; generate only questions it lacks")
     args = ap.parse_args()
     load_dotenv(os.path.join(ROOT, ".env"))
     client = anthropic.Anthropic()
-    with open(os.path.join(ROOT, "eval", "taipei_faq_testset.json"), encoding="utf-8") as f:
-        qs = [x["question"] for x in json.load(f)]
+
+    qs = list(dict.fromkeys(q for fn in TESTSETS.values() for q, _ in load_testset(fn)))
+    cache = {}
+    if args.missing and os.path.exists(OUT):
+        with open(OUT, encoding="utf-8") as f:
+            cache = json.load(f)
+        n_runs = max((len(v) for v in cache.values()), default=args.runs)
+        qs = [q for q in qs if q not in cache]
+        if not qs:
+            print("nothing missing")
+            return
+    else:
+        n_runs = args.runs
+    print(f"{len(qs)} questions x {n_runs} runs")
 
     def terms(q):
         prompt = INTENT_ANALYSIS_PROMPT.format(history="（無）", user_message=q, ui_lang="繁體中文", clarify_allowed="可以")
@@ -55,13 +75,13 @@ def main():
 
     runs = []
     with ThreadPoolExecutor(8) as ex:
-        for r in range(args.runs):
+        for r in range(n_runs):
             runs.append(list(ex.map(terms, qs)))
-            print(f"run {r + 1}/{args.runs} done")
-    out = {q: [run[i] for run in runs] for i, q in enumerate(qs)}
+            print(f"run {r + 1}/{n_runs} done")
+    cache.update({q: [run[i] for run in runs] for i, q in enumerate(qs)})
     with open(OUT, "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, indent=1)
-    print(f"wrote {OUT} ({len(out)} questions x {args.runs} runs)")
+        json.dump(cache, f, ensure_ascii=False, indent=1)
+    print(f"wrote {OUT} ({len(cache)} questions)")
 
 
 if __name__ == "__main__":

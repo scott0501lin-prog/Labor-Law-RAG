@@ -37,3 +37,6 @@ env/
 .DS_Store
 desktop.ini
 Thumbs.db
+
+# 爬蟲的排除紀錄與續爬快取（本地用，不上傳）
+backend/scraper2/data/mol_fint_skipped.json

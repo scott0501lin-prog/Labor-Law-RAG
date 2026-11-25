@@ -13,9 +13,13 @@ Systems compared (top-5 law documents per query):
            Terms are sampled, so this column is the mean over the cached runs;
            the per-run range is printed below the table.
 
-Test set: eval/taipei_faq_testset.json — questions from 台北市勞動局常見問答
-(collected in backend/scraper2), expected articles = the statutes each
-official answer cites (see eval/build_taipei_testset.py).
+Test set: eval/taipei_faq_testset.json — 台北市勞動局常見問答 (collected in
+backend/scraper2); expected articles = the statutes each official answer
+cites (see eval/build_taipei_testset.py). Only official citations are used
+here: eval/bli_pension_testset.json (勞退新制) has Claude-chosen articles and
+is kept for end-to-end evaluation, which grades against the official answer.
+To score extra test-set files, add them to TESTSETS; the first table then
+covers all of them and per-source tables follow.
 
 Metrics: Hit@5 (any expected article in top 5), Recall@5 (share of expected
 articles found). "core" restricts to items whose expected articles are all
@@ -37,15 +41,18 @@ K = 5
 
 
 
-def load_taipei():
-    with open(os.path.join(ROOT, "eval", "taipei_faq_testset.json"), encoding="utf-8") as f:
+TESTSETS = {"taipei": "taipei_faq_testset.json"}
+
+
+def load_testset(filename):
+    with open(os.path.join(ROOT, "eval", filename), encoding="utf-8") as f:
         return [(x["question"], [(e["law"], e["article_no"]) for e in x["expected"]])
                 for x in json.load(f)]
 
 
 def load_terms():
     """{question: [[term, ...] per run]} (old single-run files are wrapped)."""
-    path = os.path.join(ROOT, "eval", "taipei_search_terms.json")
+    path = os.path.join(ROOT, "eval", "search_terms.json")
     if not os.path.exists(path):
         return {}
     with open(path, encoding="utf-8") as f:
@@ -82,7 +89,8 @@ def main():
     sys.stdout.reconfigure(encoding="utf-8")
     from sentence_transformers import SentenceTransformer
 
-    sets = {"taipei": load_taipei()}
+    parts = {name: load_testset(fn) for name, fn in TESTSETS.items()}
+    sets = {"all": [it for items in parts.values() for it in items]}
 
     old_emb, _, old_metas = load_index("")
     new_emb, new_texts, new_metas = load_index("_bgem3")
@@ -99,6 +107,10 @@ def main():
         # Same as app: law query = question + search terms; article-citation
         # boost still reads only the question. One query list per run.
         n_runs = max((len(v) for v in terms.values()), default=0) or 1
+        uncached = [q for q in qs if q not in terms]
+        if terms and uncached:
+            print(f"WARNING {name}: {len(uncached)} questions have no cached search terms; "
+                  "their +terms score equals hybrid. Run: python eval/gen_search_terms.py --missing")
         run_tqs = [[" ".join([q, *(terms.get(q) or [[]] * n_runs)[r]]) for q in qs]
                    for r in range(n_runs)]
         run_tq = [new_model.encode(t, normalize_embeddings=True) for t in run_tqs]
@@ -124,17 +136,25 @@ def main():
             rows.append((q, core, [score(r, exp) for r in (before, vector, hybrid)] + [plus],
                          per_run))
 
-        print(f"\n=== {name}: {len(rows)} queries ===")
-        print(f"{'':<16}{'before':>9}{'vector':>9}{'hybrid':>9}{'+terms':>9}")
-        for label, sub in (("all", rows), ("core 勞基法+細則", [r for r in rows if r[1]])):
-            if not sub:
-                continue
-            for mi, metric in enumerate(("Hit@5", "Recall@5")):
-                vals = [sum(r[2][s][mi] for r in sub) / len(sub) for s in range(4)]
-                print(f"{metric + ' ' + label:<16}" + "".join(f"{v:>9.0%}" for v in vals)
-                      + (f"   (n={len(sub)})" if mi == 0 else ""))
+        def table(title, sub_rows):
+            print(f"\n=== {title}: {len(sub_rows)} queries ===")
+            print(f"{'':<16}{'before':>9}{'vector':>9}{'hybrid':>9}{'+terms':>9}")
+            for label, sub in (("all", sub_rows), ("core 勞基法+細則", [r for r in sub_rows if r[1]])):
+                if not sub:
+                    continue
+                for mi, metric in enumerate(("Hit@5", "Recall@5")):
+                    vals = [sum(r[2][s][mi] for r in sub) / len(sub) for s in range(4)]
+                    print(f"{metric + ' ' + label:<16}" + "".join(f"{v:>9.0%}" for v in vals)
+                          + (f"   (n={len(sub)})" if mi == 0 else ""))
+
+        table("test set (all sources)", rows)
+        start = 0
+        for part, part_items in (parts.items() if len(parts) > 1 else ()):
+            table(f"  by source: {part}", rows[start:start + len(part_items)])
+            start += len(part_items)
+        print()
         if not terms:
-            print("(+terms = hybrid: eval/taipei_search_terms.json missing — run gen_search_terms.py)")
+            print("(+terms = hybrid: eval/search_terms.json missing — run gen_search_terms.py)")
         else:
             hits = [sum(r[3][k][0] for r in rows) / len(rows) for k in range(n_runs)]
             print(f"+terms Hit@5 per run ({n_runs} runs): "

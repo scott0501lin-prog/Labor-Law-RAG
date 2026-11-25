@@ -51,6 +51,10 @@ LAW_FILES = [
     "leave_rules.json",                # 勞工請假規則
 ]
 FAQ_FILES      = ["taipei_faq_cases.json", "mol_faq_cases.json"]
+# 台北市 FAQ 中被選為測試題的題目不進索引，否則測試時系統會查到原題答案。
+# 測試集由 eval/build_taipei_testset.py 從 taipei_faq_cases.json 產生。
+TESTSET_FILE   = os.path.join(os.path.dirname(BASE_DIR), "eval", "taipei_faq_testset.json")
+TESTSET_FAQ    = "taipei_faq_cases.json"
 FINT_FILE      = "mol_fint_cases.json"
 JUDICIAL_FILE  = "judicial_cases.json"
 EXTRA_CASE_FILES = ["derived_interpretations.json"]   # backend/data，手動整理
@@ -115,12 +119,20 @@ def _case_meta(item, parent_id, idx, display, **extra):
     return m
 
 
+def load_testset_questions():
+    return {x["question"].strip() for x in load_json(TESTSET_FILE)}
+
+
 def build_faq_chunks(texts, metas):
+    held_out = load_testset_questions()
     for fn in FAQ_FILES:
         items = load_json(os.path.join(S2_DIR, fn))
-        print(f"  {fn}: {len(items)} 題")
+        skipped = 0
         for i, item in enumerate(items):
             title, content = item["title"].strip(), item["content"].strip()
+            if fn == TESTSET_FAQ and title in held_out:
+                skipped += 1
+                continue
             if not content:
                 continue
             header = f"【{item['source']} {item.get('category', '')}】問：{title}"
@@ -128,6 +140,10 @@ def build_faq_chunks(texts, metas):
             for idx, chunk in enumerate(smart_split(content, CASE_MAX_CHARS, CASE_OVERLAP)):
                 texts.append(f"{header}\n答：{chunk}")
                 metas.append(_case_meta(item, f"{fn[:-5]}_{i}", idx, display))
+        print(f"  {fn}: {len(items)} 題" + (f"（排除測試集 {skipped} 題）" if skipped else ""))
+        if fn == TESTSET_FAQ and skipped != len(held_out):
+            raise SystemExit(f"測試集有 {len(held_out)} 題，但只在 {fn} 找到 {skipped} 題；"
+                             "請重跑 eval/build_taipei_testset.py")
 
 
 def build_fint_chunks(texts, metas):

@@ -6,8 +6,9 @@ Those citations become the expected law articles for the FAQ question, so the
 set measures *law* retrieval: query = question title, hit = an expected
 article appears in the top-k law results.
 
-Note: the same FAQs are also indexed as cases, so this set must not be used
-to score case retrieval (the question would just find itself).
+Note: backend/build_index.py leaves these questions out of the case index, so
+the system never retrieves a test question's own answer. After regenerating
+this set, rebuild the case index (python backend/build_index.py --only cases).
 
 Usage:  python eval/build_taipei_testset.py
 Output: eval/taipei_faq_testset.json
@@ -85,8 +86,13 @@ def main():
         with open(os.path.join(S2, fn + ".json"), encoding="utf-8-sig") as f:
             corpus |= {(x["source"], x["article_no"]) for x in json.load(f)}
 
-    items, missing, no_cite = [], [], 0
+    items, missing, no_cite, self_cite = [], [], 0, 0
     for i, x in enumerate(faqs):
+        # A question that names an article (「勞基法第56條…」) hands the answer to
+        # law retrieval: an explicit citation gets a rank-1 vote in hybrid_search.
+        if extract_citations(x["title"]):
+            self_cite += 1
+            continue
         cites = extract_citations(x["content"])
         valid = [c for c in cites if c in corpus]
         missing += [(x["title"], c) for c in cites if c not in corpus]
@@ -106,7 +112,8 @@ def main():
         json.dump(items, f, ensure_ascii=False, indent=1)
 
     sys.stdout.reconfigure(encoding="utf-8")
-    print(f"FAQs: {len(faqs)}  →  test items: {len(items)}  (no usable citation: {no_cite})")
+    print(f"FAQs: {len(faqs)}  →  test items: {len(items)}  "
+          f"(question cites an article: {self_cite}, no usable citation: {no_cite})")
     print(f"expected articles: {sum(len(x['expected']) for x in items)}")
     by_law = {}
     for x in items:

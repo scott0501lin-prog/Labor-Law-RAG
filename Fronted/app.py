@@ -621,16 +621,9 @@ from prompt_helpers import (
     stream_reply,
 )
 from intent_router import make_plan, heuristic_intent, detect_laws, INTENTS
-from eval_holdout import case_filter
 from penalties import build_penalty_map, penalties_for, label_paragraphs
 
 PENALTY_POOL = 10   # law results searched for penalty provisions when asked about 罰則
-
-# None in the live app; with EVAL_HOLDOUT=1 the test set's own FAQ answers
-# are excluded from case retrieval (see eval_holdout.py).
-_CASE_ALLOW = case_filter()
-if _CASE_ALLOW is not None:
-    print("[EVAL] EVAL_HOLDOUT on: 台北 FAQ test questions excluded from case retrieval", flush=True)
 
 
 # ==========================================
@@ -1020,7 +1013,7 @@ def query_rag_system(
         else:
             _case_vec = lambda k, kc: _search(model, search_query, case_emb, case_texts, case_metas, top_k=k, _top_k_chunks=kc)
         c_results = _retrieve(_case_vec, "cases", _backend, search_query, case_texts, case_metas,
-                              top_k=plan.case_k, allow=_CASE_ALLOW)
+                              top_k=plan.case_k)
         _t_case_search = time.perf_counter()
 
         _overtime_kw = next(r["keywords"] for r in FORCE_ARTICLE_RULES if r["name"] == "加班延長工時")

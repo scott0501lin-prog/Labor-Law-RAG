@@ -2,7 +2,7 @@
 MongoDB Atlas 資料層
 負責：使用者帳號（註冊 / 登入驗證）、歷史對話紀錄的存取
 """
-
+from __future__ import annotations
 import os
 import hashlib
 from datetime import datetime, timezone
@@ -26,7 +26,7 @@ def get_client() -> MongoClient:
     if _client is None:
         if not MONGO_URI:
             raise RuntimeError("尚未設定 MONGO_URI，請在 .env 中加入 MongoDB Atlas 連線字串。")
-        _client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
+        _client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=5000, connectTimeoutMS=5000, socketTimeoutMS=8000)
     return _client
 
 

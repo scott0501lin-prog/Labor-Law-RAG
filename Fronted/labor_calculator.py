@@ -1,51 +1,31 @@
-"""勞動基準法一般月薪制加班費概算。
+"""一般月薪制加班費概算，不判斷實際出勤是否合法。"""
+from fractions import Fraction
+from decimal import Decimal, InvalidOperation
 
-目前只估算平日及休息日加班；例假日、國定假日、變形工時、
-部分工時及工資項目認定等情形，需另依個案與最新法規核對。
-"""
-from __future__ import annotations
+
+def _positive(value, label):
+    if isinstance(value, bool): raise ValueError(f'{label}格式錯誤。')
+    try: d=Decimal(str(value))
+    except (InvalidOperation, ValueError): raise ValueError(f'{label}格式錯誤。') from None
+    if not d.is_finite() or d <= 0 or d > Decimal('100000000') or d.as_tuple().exponent < -8:
+        raise ValueError(f'{label}必須為合理且大於零的有限數值。')
+    return Fraction(d)
 
 
 def calculate_overtime(monthly_wage: float, hours: float, day_type: str) -> dict:
-    """Return estimated overtime pay and a tier-by-tier breakdown."""
-    wage = float(monthly_wage)
-    overtime_hours = float(hours)
-    if wage <= 0:
-        raise ValueError("月薪必須大於 0。")
-    if overtime_hours <= 0:
-        raise ValueError("加班時數必須大於 0。")
-    if overtime_hours > 12:
-        raise ValueError("單次試算最多輸入 12 小時，請確認工時及適用規則。")
-
-    hourly_wage = wage / 240.0
-    if day_type == "平日":
-        tiers = [(2.0, 4 / 3, "前 2 小時"), (2.0, 5 / 3, "第 3–4 小時")]
-    elif day_type == "休息日":
-        tiers = [
-            (2.0, 4 / 3, "第 1–2 小時"),
-            (6.0, 5 / 3, "第 3–8 小時"),
-            (4.0, 8 / 3, "第 9–12 小時"),
-        ]
-    else:
-        raise ValueError("目前僅支援平日及休息日；例假日、國定假日請另行確認。")
-
-    remaining = overtime_hours
-    breakdown = []
-    total = 0.0
-    for cap, multiplier, label in tiers:
-        used = min(remaining, cap)
-        if used <= 0:
-            break
-        amount = hourly_wage * multiplier * used
-        breakdown.append({"label": label, "hours": used, "multiplier": multiplier, "amount": amount})
-        total += amount
-        remaining -= used
-
-    return {
-        "monthly_wage": wage,
-        "hourly_wage": hourly_wage,
-        "hours": overtime_hours,
-        "day_type": day_type,
-        "breakdown": breakdown,
-        "total": total,
-    }
+    wage=_positive(monthly_wage,'月薪'); h=_positive(hours,'加班時數')
+    if day_type=='平日':
+        tiers=[(2,Fraction(4,3),'前 2 小時'),(2,Fraction(5,3),'第 3–4 小時')]
+        if h>4: raise ValueError('一般每日正常工時 8 小時，平日加班逾 4 小時不適用本試算；特殊情形需另外核對。')
+    elif day_type=='休息日':
+        tiers=[(2,Fraction(4,3),'第 1–2 小時'),(6,Fraction(5,3),'第 3–8 小時'),(4,Fraction(8,3),'第 9–12 小時')]
+        if h>12: raise ValueError('休息日逾 12 小時不適用本試算。')
+    else: raise ValueError('目前只支援一般月薪制平日及休息日。')
+    hourly=wage/240; remaining=h; total=Fraction(0); breakdown=[]
+    for cap,m,label in tiers:
+        used=min(remaining,cap)
+        if used<=0: break
+        amount=hourly*m*used; total+=amount; remaining-=used
+        breakdown.append(dict(label=label,hours=float(used),multiplier=float(m),fraction=str(m),amount=float(amount)))
+    if remaining: raise ValueError('超出支援的試算範圍。')
+    return dict(monthly_wage=float(wage),hourly_wage=float(hourly),hours=float(h),day_type=day_type,breakdown=breakdown,total=float(total),source='https://calcr2.mol.gov.tw/Monthly')

@@ -127,7 +127,7 @@ def build_law_chunks_legacy(laws):
         article_no = item.get("article_no", "")
         full_text  = item.get("text", "")
         label      = _make_label(source, article_no)
-        parent_id  = f"law_{article_no}"
+        parent_id  = f"law_{source}_{article_no}"
         raw_chunks, _ = _make_chunks_legacy(full_text)
         for idx, chunk in enumerate(raw_chunks[:MAX_CHUNKS_PER_DOC]):
             embed_texts.append(label + chunk)
@@ -147,7 +147,7 @@ def build_law_chunks_bgem3(laws):
         article_no = item.get("article_no", "")
         full_text  = item.get("text", "")
         label      = f"【{source} {article_no}】"
-        parent_id  = f"law_{article_no}"
+        parent_id  = f"law_{source}_{article_no}"
         merged     = f"{label}\n{full_text}"
         chunks     = smart_split(merged, LAW_MAX_CHARS, overlap=50)
         for idx, chunk in enumerate(chunks[:MAX_CHUNKS_PER_DOC]):

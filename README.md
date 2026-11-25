@@ -9,124 +9,59 @@ app_file: Fronted/app.py
 pinned: false
 ---
 
-# ⚖️ 勞資爭議智慧法務 AI 顧問系統
+# 勞動法規專家知識庫 — 正確性優先 / Fast Verified RAG
 
-一套以 RAG（檢索增強生成）為核心的台灣勞動法律諮詢平台，協助勞方與資方快速查詢勞動基準法相關規定、案例與權益說明。
+以使用者提供的 `Labor-Law-RAG-main 6(1).zip` 為基礎，保留原本 Streamlit UI、勞資雙角色、MongoDB 帳號及歷史紀錄、原始資料與舊向量索引。未修改遠端 GitHub。正式聊天改用 `Fronted/verified_rag.py`，不再把模型撰寫的法律結論直接顯示給使用者。
 
----
+## 快速啟動（Mac / VS Code）
 
-## 功能特色
-
-- **雙角色入口**：勞方（員工）與資方（雇主 / HR）分別提供不同的諮詢語氣與法律視角
-- **RAG 智慧檢索**：結合 NumPy 向量搜尋與 Gemini 2.5 Flash，依據問題自動檢索最相關的法條與案例
-- **法條強制帶入**：針對加班費、資遣、特休、國定假日等高頻主題，確保關鍵條文不被遺漏
-- **多語系支援**：繁體中文、English、日本語、한국어、Bahasa Indonesia、Tiếng Việt、Filipino
-- **歷史對話紀錄**：登入後自動儲存每次對話，隨時可切換查看
-- **帳號系統**：SHA-256 加鹽雜湊密碼保護，MongoDB Atlas 雲端儲存
-
----
-
-## 技術架構
-
-| 層級 | 技術 |
-|------|------|
-| 前端介面 | Streamlit |
-| 語言生成模型 | Google Gemini 2.5 Flash |
-| 語意嵌入模型 | shibing624/text2vec-base-chinese（Sentence-Transformers）|
-| 向量檢索 | NumPy 餘弦相似度 |
-| 帳號 / 對話儲存 | MongoDB Atlas |
-| 資料蒐集 | Requests + BeautifulSoup + Playwright/Selenium |
-| 版本控制 | Git / GitHub |
-| 雲端部署 | Streamlit Community Cloud |
-
----
-
-## 安裝與執行
-
-### 1. 複製專案
+解壓縮後，使用 VS Code 開啟 `Labor-Law-RAG-Verified` 資料夾，在終端機執行：
 
 ```bash
-git clone https://github.com/scott0501lin-prog/Labor-Law-RAG.git
-cd Labor-Law-RAG
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+cp .env.example .env
 ```
 
-### 2. 安裝套件
+將原本的 `ANTHROPIC_API_KEY`、`MONGO_URI` 填入 `.env`，沿用原本的 MongoDB 資料庫名稱。不要提交 `.env`。沒有 Claude 金鑰仍可做精準法條及支援的 FAQ 查詢，但登入需要 MongoDB。
 
 ```bash
-pip install -r requirements.txt
-```
-
-### 3. 設定環境變數
-
-在根目錄建立 `.env` 檔案：
-
-```
-GEMINI_API_KEY=你的_Gemini_API_Key
-MONGO_URI=你的_MongoDB_連線字串
-```
-
-### 4. 建立向量索引（首次執行）
-
-```bash
-python backend/build_index.py
-```
-
-### 5. 啟動應用程式
-
-```bash
+python -m unittest discover -s tests -v
 streamlit run Fronted/app.py
 ```
 
----
+### Hugging Face Space
 
-## 專案結構
+維持原本的 `Fronted/app.py` 為啟動檔，將新檔案同步至你的 repository，再部署。原有 Secrets `ANTHROPIC_API_KEY`、`MONGO_URI` 不需放入 ZIP；確認 Space 仍設定這些 Secrets。`CLAUDE_MODEL` 可依帳號可用模型調整。不要覆蓋遠端資料庫。若使用的 Space 不支援 Streamlit SDK，需沿用原本 Space 的 Docker 或部署設定；本 ZIP 未取得其遠端設定。
 
-```
-├── Fronted/
-│   ├── app.py          # 主應用程式（Streamlit UI + RAG 引擎）
-│   ├── db.py           # MongoDB 資料層（帳號、對話紀錄）
-│   └── i18n.py         # 多語系介面文字
-├── backend/
-│   ├── build_index.py  # 預計算 embedding 並儲存為 .npy
-│   ├── embeddings/     # 預計算的向量索引（.npy + .json）
-│   ├── labor_law_cleaned.json
-│   ├── labor_law_rules_cleaned.json
-│   └── *_cases.json    # 各類案例資料
-├── requirements.txt
-└── .env                # 機密設定（不上傳 GitHub）
-```
+## 核心流程
 
----
+1. 讀取原始及清理法規 JSON，逐條比較法規名稱、條號、網址與內容；排除刪除條文。原始與清理資料有差異就拒答。
+2. 精準法條或有限的 FAQ 使用程式直接查詢，不呼叫 LLM。
+3. 其餘問題透過 BM25 中文字元檢索、精準條號及主題規則選擇候選條文。可選用既有向量索引進行 RRF 混合排序。
+4. Claude 只回傳證據 ID 與段落編號，單次呼叫，限制輸出長度。結構錯誤、虛構 ID、截斷或 API 失敗一律拒答。
+5. 預設核對官方全國法規資料庫網頁原文，成功快取 15 分鐘；同時需要兩部法律時並行抓取。若有異動，停止輸出該次舊條文；若網站無法連線，只能明確標示為未核對的本地歷史參考資料。這不是自動更新或歷史有效版本驗證。
+6. 由程式組裝完整原文、相關段落與官方網址，整份驗證後才顯示。案例等按下按鈕才查詢，且不作為已驗證的法律依據。
 
-## 雲端部署
+## 效能設定
 
-本系統已部署至 **Streamlit Community Cloud**，無需本地安裝即可直接使用。
+| 環境變數 | 預設 | 說明 |
+|---|---|---|
+| `VERIFY_OFFICIAL` | `true` | 官方文字核對。關閉時必須標示離線未核對。 |
+| `RAG_SEMANTIC` | `false` | 預設 BM25＋規則，免下載大型模型；true 開啟向量融合。 |
+| `EMBED_MODEL` | `text2vec` | 只有啟用向量融合才需使用；隨附 text2vec 索引。 |
+| `CLAUDE_MODEL` | `claude-haiku-4-5-20251001` | 可設定帳號目前有權使用的 Claude 模型。 |
 
----
+若要進行向量研究或比較原始系統，另安裝 `pip install -r requirements-research.txt`，設定 `RAG_SEMANTIC=true` 並確認對應索引已存在。舊版 benchmark_timing.py 及 eval/benchmark_models.py 用於歷史架構，不是新版端到端效能測試。使用 `python eval/benchmark_verified.py` 測量新版離線檢索。部署若未上傳被 .gitignore 排除的 embeddings，預設模式仍可使用。
 
-## 注意事項
+## 重要限制
 
-- `.env` 檔案含有 API 金鑰與資料庫連線字串，已加入 `.gitignore`，**請勿上傳至 GitHub**
-- 本系統提供的法律資訊僅供參考，不構成正式法律建議
+- 不是 100% 法律正確的專家系統。引用存在與文字一致不等於檢索完整、解釋正確或個案適用。正式模式刻意限制自由生成白話法律結論；多語系 UI 保留，但來源原文是繁體中文，翻譯及完整對話追問暫不啟用。請將完整事件事實放在同一問題中。
+- 法律資料目前僅支援勞動基準法與施行細則。其他法規、歷史修法版本、法律函釋適用性及法院裁判效力尚未全面核對。不能將本地資料當作現行完整法規。
+- 內建加班費計算器只支援一般月薪制平日（最多 4 小時）及休息日（最多 12 小時），公式使用有理數；不支援特殊制度。公式參考[勞動部月薪制試算](https://calcr2.mol.gov.tw/Monthly)及[勞動部加班補休規定](https://www.mol.gov.tw/1607/28162/28166/28180/28198/28202/47031/post)，尚未自動同步公式修法。
+- 本地案例原文與資料欄位未改寫，不保證內容最新；衍生整理資料不進入案例查詢。舊聊天紀錄保留，不代表重新驗證過。
+- 原版 MongoDB 帳密及權限機制未全面安全審計。正式公開上線前應額外檢查資安、個資與法律專家驗收。
+- 測試使用模擬 Claude 與官方網頁資料。沒有你的金鑰、MongoDB 和實際 Space 運行環境，未做完整登入、雲端 API、官方網站連線及真實法律專家準確率測試。無法保證真實端到端時間。
 
----
-
-## 開發團隊
-
-淡江大學 資訊管理學系  
-畢業專題 — 2026 年
-
-
-## 本次程式增修
-
-- **加班費快速概算**：聊天室新增獨立計算器，支援一般月薪制的平日與休息日加班，列出分段計算明細。
-- **法規來源提示**：檢索到勞動基準法或其施行細則時，將法規名稱、條號及法務部全國法規資料庫查詢連結放入回答上下文。
-- **相似案例資訊卡**：增加相似度及資料集中實際存在的地區、違規法條、日期、金額欄位；沒有欄位就不顯示、不推測。
-
-### 資料範圍提醒
-
-目前 ZIP 內的案例資料包含勞動部、新北市及臺北市等來源；**未發現桃園市違反勞動基準法裁罰名單資料**。因此本次沒有宣稱已完成桃園裁罰案例比對。要加入桃園資料，需匯入原始裁罰名單並重新建立案例索引。
-
-### 加班費概算限制
-
-此工具只適用一般月薪制的平日及休息日加班概算。例假日、國定假日、變形工時、部分工時、補休及工資項目認定等特殊情況，需另行核對法規與個案事實；估算結果不等同正式法律認定。
+詳見 `VERIFICATION_REPORT.md`。

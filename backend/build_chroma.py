@@ -80,7 +80,7 @@ def build_law_chunks(laws):
         source     = item.get("source", "勞動基準法")
         article_no = item.get("article_no", "")
         full_text  = item.get("text", "")
-        parent_id  = f"law_{article_no}"
+        parent_id  = f"law_{source}_{article_no}"
         for idx, chunk in enumerate(smart_split(full_text, LAW_MAX_CHARS, 50)[:MAX_CHUNKS_PER_DOC]):
             texts.append(chunk)
             metas.append({

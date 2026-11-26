@@ -57,6 +57,8 @@ INTENT_ANALYSIS_PROMPT = """\
   "laws": ["相關法規，依關聯度排序，只能從：勞動基準法、勞動基準法施行細則、勞工退休金條例、勞工職業災害保險及保護法、最低工資法、勞工請假規則"],
   "search_terms": ["3 到 6 個法規條文會使用的詞語，用來檢索法條"],
   "violation": true 或 false,
+  "overtime": {{"day_type": "平日／休息日／國定假日／例假日 或 null", "hours": 數字或 null,
+               "monthly_wage": 數字或 null, "hourly_wage": 數字或 null}} 或 null,
   "clarify": {{
     "needed": true 或 false,
     "questions": [{{"q": "問題", "options": ["選項1", "選項2"]}}]
@@ -93,6 +95,8 @@ INTENT_ANALYSIS_PROMPT = """\
   不要寫條號。out_of_scope 時給空陣列
 - violation：問題涉及雇主（或投保單位）可能違反規定（例如不給加班費、未提繳退休金、
   未依法預告就解僱），或直接詢問罰則、罰鍰、檢舉時為 true；單純詢問制度內容或計算方式為 false
+- overtime：只有在使用者想知道自己某次加班可以拿多少加班費時填寫（含先前對話提供的事實），其他問題給 null。
+  數字一律換成阿拉伯數字（「月薪五萬」→ monthly_wage 50000；「三小時」→ hours 3），不知道的欄位填 null，不要猜。
 - clarify：本系統要像顧問一樣先弄清楚狀況再給建議，不要把各種可能情況全部列給使用者。
   - needed 為 true 的條件（全部成立）：intent 為 solve_problem；使用者（含先前對話）沒有提供某些事實，
     而這些事實會改變適用的規定、處理方式或計算結果；「這次是否還可以反問使用者」為「可以」。

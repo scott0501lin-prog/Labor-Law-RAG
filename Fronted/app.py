@@ -622,6 +622,7 @@ from prompt_helpers import (
 )
 from intent_router import make_plan, heuristic_intent, detect_laws, INTENTS
 from penalties import build_penalty_map, penalties_for, label_paragraphs
+from overtime_calc import overtime_pay
 
 PENALTY_POOL = 10   # law results searched for penalty provisions when asked about 罰則
 
@@ -635,6 +636,15 @@ import re as _re
 # Retry only when the stream fails before any text was shown to the user
 CLAUDE_MAX_ATTEMPTS = 2
 CLAUDE_MODEL = "claude-haiku-5-5"
+# Answer budget. At 2048 a long answer (history + penalty articles) was cut
+# mid-sentence; the system prompt also asks for a compact answer.
+ANSWER_MAX_TOKENS = 4096
+# Haiku 5.5 thinks by default; thinking tokens count as output and delay the
+# first visible word (8-11 s TTFT measured on the overtime flow). Arithmetic
+# is done in code (overtime_calc.py), so answers are generated without it.
+# ANSWER_THINKING=adaptive restores the default.
+_ANSWER_THINKING = ({"type": "adaptive"} if os.getenv("ANSWER_THINKING", "").lower() == "adaptive"
+                    else {"type": "disabled"})
 
 
 @st.cache_resource
@@ -677,7 +687,7 @@ def _claude_json_call_once(prompt_text: str, _label: str) -> dict | None:
         client = _get_anthropic_client(api_key)
         resp = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=1024,
+            max_tokens=2048,   # clarify questions can make the JSON long
             thinking=_NO_THINKING,
             messages=[{"role": "user", "content": prompt_text}],
         )
@@ -867,11 +877,17 @@ def _answer(query: str, analysis: dict, persona: str, lang: str, history: list,
     laws = analysis.get("laws") or detect_laws(query)
     terms = [x for x in (analysis.get("search_terms") or []) if isinstance(x, str)]
     missing = [q["q"] for q in (unanswered or [])]
-    print(f"[INTENT] 分支: 回答 | intent={intent!r} laws={laws} general={bool(missing)}")
+    # Overtime pay is computed in code (overtime_calc.py): same facts, same numbers.
+    ot = analysis.get("overtime") if isinstance(analysis.get("overtime"), dict) else {}
+    calc = overtime_pay(ot.get("day_type"), ot.get("hours"),
+                        monthly_wage=ot.get("monthly_wage"), hourly_wage=ot.get("hourly_wage")) if ot else None
+    print(f"[INTENT] 分支: 回答 | intent={intent!r} laws={laws} general={bool(missing)} "
+          f"calc={calc.total if calc else None}")
     return query_rag_system(query, persona, lang, search_query_override=query,
                             intent=intent, laws=laws, search_terms=terms,
                             violation=analysis.get("violation"), history=history,
-                            missing_fields=missing or None, general=bool(missing))
+                            missing_fields=missing or None, general=bool(missing),
+                            calc_note=calc.as_prompt() if calc else "")
 
 
 # ==========================================
@@ -899,6 +915,7 @@ def query_rag_system(
     history: list | None = None,
     violation: bool | None = None,
     general: bool = False,
+    calc_note: str = "",
 ) -> str | Iterator[str]:
     """Run retrieval eagerly, then return a generator that streams the answer.
 
@@ -922,6 +939,8 @@ def query_rag_system(
         if provided, the internal translation call is skipped.
     missing_fields: facts the user didn't give (the unanswered clarifying
         questions); listed in the prompt so the model doesn't assume them.
+    calc_note: 【試算結果】 block computed in code (overtime_calc.py); the model
+        must use its numbers instead of doing the arithmetic.
     general: the user skipped the clarifying questions; a consult answer uses
         the 「一般說明」 format (no 結論 the facts can't support).
     """
@@ -1043,6 +1062,8 @@ def query_rag_system(
         # Facts still missing after the clarifying round(s), so the model
         # won't invent numbers or pick one scenario.
         missing_note = build_missing_note("；".join(missing_fields or []))
+        if calc_note:
+            missing_note += "\n" + calc_note
         mode = "general" if general and plan.mode == "consult" else plan.mode
 
         final_prompt = build_user_prompt(law_ctx, user_prompt, lang_rule, missing_note,
@@ -1052,7 +1073,7 @@ def query_rag_system(
     except Exception as e:
         return f"🚨 異常：{str(e)}"
 
-    _stats = {"t_first": None, "usage": None, "retries": 0}
+    _stats = {"t_first": None, "usage": None, "retries": 0, "stop": None}
 
     def _raw() -> Iterator[str]:
         """Yield raw Claude text chunks, recording first-token time and usage.
@@ -1065,7 +1086,8 @@ def query_rag_system(
             try:
                 with client.messages.stream(
                     model=CLAUDE_MODEL,
-                    max_tokens=2048,
+                    max_tokens=ANSWER_MAX_TOKENS,
+                    thinking=_ANSWER_THINKING,
                     system=system_prompt,
                     messages=[*_history_messages(history),
                               {"role": "user", "content": final_prompt}],
@@ -1079,6 +1101,7 @@ def query_rag_system(
                     final_msg = stream.get_final_message()
                     if final_msg:
                         _stats["usage"] = final_msg.usage
+                        _stats["stop"] = final_msg.stop_reason
                 return
             except Exception as e:
                 if emitted or attempt == CLAUDE_MAX_ATTEMPTS:
@@ -1124,9 +1147,13 @@ def query_rag_system(
             f"total={_t_claude-_t0:.3f}s "
             f"prompt_chars={len(final_prompt)} "
             f"input_tok={_input_tok} output_tok={_output_tok} "
-            f"scope={'OUT' if is_out else 'IN'} retries={_stats['retries']} "
+            f"scope={'OUT' if is_out else 'IN'} retries={_stats['retries']} stop={_stats['stop']} "
             f"intent={plan.intent} laws={','.join(plan.laws)}"
         )
+
+        if _stats["stop"] == "max_tokens":
+            # Never end silently mid-sentence (it happened at the old 2048 cap).
+            yield "\n\n⚠️ 回答超過長度上限而被截斷，請把問題拆成較小的部分再問一次。"
 
         # OUT_OF_SCOPE_TEXT already lists referral channels
         if not is_out:

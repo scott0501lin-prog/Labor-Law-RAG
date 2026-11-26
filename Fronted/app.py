@@ -623,6 +623,7 @@ from prompt_helpers import (
 from intent_router import make_plan, heuristic_intent, detect_laws, INTENTS
 from penalties import build_penalty_map, penalties_for, label_paragraphs
 from overtime_calc import overtime_pay
+from clarify_scenarios import build_questions
 
 PENALTY_POOL = 10   # law results searched for penalty provisions when asked about 罰則
 
@@ -789,6 +790,22 @@ class ClarifyReply(str):
         return obj
 
 
+def _pick_questions(cl: dict, lang: str) -> list[dict]:
+    """Clarifying questions from the team's catalogue (clarify_scenarios.py):
+    the model only names the question ids, so the same situation is always
+    asked with the same wording and options. Other UI languages use the
+    model's translation of those questions when it lines up."""
+    questions = build_questions(cl.get("ask"), limit=MAX_CLARIFY_QUESTIONS)
+    if lang != "繁體中文" and questions:
+        tr = _clean_questions(cl.get("translated"))
+        if len(tr) == len(questions):
+            for q, t_ in zip(questions, tr):
+                q["q"] = t_["q"]
+                if len(t_["options"]) == len(q["options"]):
+                    q["options"] = t_["options"]
+    return questions
+
+
 def _clean_questions(raw) -> list[dict]:
     """Validate the model's clarify.questions: [{"q": str, "options": [str]}]."""
     out = []
@@ -889,7 +906,8 @@ def _handle_prompt(prompt: str, persona: str, lang: str) -> str | Iterator[str]:
     else:
         search = query
     cl = analysis.get("clarify") or {}
-    questions = _clean_questions(cl.get("questions"))
+    questions = _pick_questions(cl, lang)
+    print(f"[INTENT] 情境={cl.get('scenario')!r} ask={cl.get('ask')}")
     needs = bool(cl.get("needed")) and bool(questions) and analysis.get("intent") == "solve_problem"
 
     if needs and rounds < MAX_FOLLOWUP_ROUNDS:

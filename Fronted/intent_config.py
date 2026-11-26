@@ -5,6 +5,8 @@ without touching app.py.
 """
 import os
 
+from clarify_scenarios import catalog_text
+
 # ── Feature toggle ────────────────────────────────────────────────────────────
 # On by default: the intent decides which corpora are searched and which
 # answer format is used (see intent_router.py). The same call also does the
@@ -43,7 +45,7 @@ INTENT_ANALYSIS_PROMPT = """\
 ## 使用者訊息
 {user_message}
 
-## 介面語言（clarify 的問題與選項須使用此語言）
+## 介面語言
 {ui_lang}
 
 ## 這次是否還可以反問使用者
@@ -60,7 +62,9 @@ INTENT_ANALYSIS_PROMPT = """\
                "monthly_wage": 數字或 null, "hourly_wage": 數字或 null}} 或 null,
   "clarify": {{
     "needed": true 或 false,
-    "questions": [{{"q": "問題", "options": ["選項1", "選項2"]}}]
+    "scenario": "反問清單中的情境代號，或 other",
+    "ask": ["要問的問題代號，例如 o2、o3"],
+    "translated": [{{"q": "問題", "options": ["選項"]}}]
   }}
 }}
 
@@ -92,14 +96,15 @@ INTENT_ANALYSIS_PROMPT = """\
 - overtime：只有在使用者想知道自己某次加班可以拿多少加班費時填寫（含先前對話提供的事實），其他問題給 null。
   數字一律換成阿拉伯數字（「月薪五萬」→ monthly_wage 50000；「三小時」→ hours 3），不知道的欄位填 null，不要猜。
 - clarify：本系統要像顧問一樣先弄清楚狀況再給建議，不要把各種可能情況全部列給使用者。
+  反問只能從下方「反問清單」挑選，用問題代號表示，不要自己寫新的問題。
   - needed 為 true 的條件（全部成立）：intent 為 solve_problem；使用者（含先前對話）沒有提供某些事實，
     而這些事實會改變適用的規定、處理方式或計算結果；「這次是否還可以反問使用者」為「可以」。
-  - 例：「被公司調職到外縣市怎麼辦？」→ 問「勞動契約或工作規則有沒有約定可以調動工作地點？」
-    〔有約定／沒有約定／不確定〕、「調動後薪資或職務有沒有變差？」〔沒有變差／有變差〕；
-    「加班費怎麼算？」→ 問「是哪一天加班？」〔平日／休息日／例假日／國定假日〕、
-    「加班幾小時？」、「月薪或時薪多少？」（數字題 options 給空陣列）。
   - 問題已經具體、事實足以回答、或只是問制度規定（law_lookup）、找案例（find_cases）時 needed 為 false。
-  - questions 最多 3 題，只問會影響答案的事，先問最關鍵的；能用選項回答的給 2 到 4 個簡短選項，
-    數字或自由回答的 options 給空陣列；不要重問使用者已回答或已選擇跳過的事。
-  - needed 為 false 時 questions 給空陣列。
+  - scenario：選最符合的情境；都不符合時填 other。
+  - ask：從該情境（以及通用問題）挑最多 3 題，依重要性排序：先挑會改變適用規定或計算結果的事實，
+    只挑使用者還沒回答過的；不要挑與答案無關的題目。needed 為 false 時給空陣列。
+  - translated：介面語言是繁體中文時給空陣列；否則依 ask 的順序，把每題問題與選項翻譯成介面語言。
+
+## 反問清單
+""" + catalog_text() + """
 """

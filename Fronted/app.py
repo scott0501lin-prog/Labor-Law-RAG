@@ -807,6 +807,31 @@ def _clarify_text(questions: list[dict], lang: str) -> str:
     return "\n".join(lines)
 
 
+_LAW_SHORT = {"勞動基準法": "勞基", "勞動基準法施行細則": "細則", "勞工退休金條例": "勞退",
+              "勞工職業災害保險及保護法": "災保", "最低工資法": "最低工資", "勞工請假規則": "請假"}
+
+
+def _short_art(meta: dict) -> str:
+    """「勞基§24」 style label for logs."""
+    no = str(meta.get("article_no", "")).replace("第", "").replace("條", "").strip()
+    return f"{_LAW_SHORT.get(meta.get('source'), meta.get('source', ''))}§{no}"
+
+
+def _answers_only(reply: str) -> str:
+    """「問題：答案；問題：答案」 from the clarify form → 「答案；答案」.
+
+    The question wording is generated per run; only the user's answers should
+    reach retrieval. Free-typed replies are returned unchanged."""
+    parts = [p for p in reply.split("；") if p.strip()]
+    if parts and all("：" in p for p in parts[:-1]):
+        return "；".join(p.rsplit("：", 1)[-1].strip() if "：" in p else p.strip() for p in parts)
+    return reply
+
+
+def _mostly_chinese(text: str) -> bool:
+    return sum("一" <= c <= "鿿" for c in text) / max(len(text), 1) >= 0.3
+
+
 def _is_skip(text: str) -> bool:
     return len(text) <= SKIP_MAX_LEN and any(kw in text for kw in SKIP_FOLLOWUP_TRIGGERS)
 
@@ -839,7 +864,7 @@ def _handle_prompt(prompt: str, persona: str, lang: str) -> str | Iterator[str]:
         print("[INTENT] 使用者跳過補問 → 一般說明")
         st.session_state.intent_ctx = None
         return _answer(ctx["query"], ctx["analysis"], persona, lang, history,
-                       unanswered=ctx["questions"])
+                       unanswered=ctx["questions"], search=ctx.get("search"))
 
     rounds = ctx["rounds"] if ctx else 0
     analysis = _analyze_intent(prompt, lang, history,
@@ -852,30 +877,40 @@ def _handle_prompt(prompt: str, persona: str, lang: str) -> str | Iterator[str]:
     if ctx and not analysis.get("is_followup"):
         rounds = 0                        # the user moved on to a new question
     query = analysis.get("translated_query") or prompt
+    if not analysis.get("is_followup") and _mostly_chinese(prompt):
+        # A standalone Chinese question is searched verbatim: the model's copy
+        # sometimes changes punctuation or a word, which shifts retrieval.
+        query = prompt
+    if ctx and analysis.get("is_followup"):
+        # Answers to our clarifying questions: search with the original question
+        # plus the answers joined in code. The model's rewrite (query) still
+        # goes to the answer call, but it varies per run, and so did retrieval.
+        search = f"{ctx['search']}；{_answers_only(prompt)}"
+    else:
+        search = query
     cl = analysis.get("clarify") or {}
     questions = _clean_questions(cl.get("questions"))
     needs = bool(cl.get("needed")) and bool(questions) and analysis.get("intent") == "solve_problem"
 
     if needs and rounds < MAX_FOLLOWUP_ROUNDS:
         print(f"[INTENT] 分支: 補問 (round={rounds + 1}) | {[q['q'] for q in questions]}")
-        st.session_state.intent_ctx = {"query": query, "rounds": rounds + 1,
+        st.session_state.intent_ctx = {"query": query, "search": search, "rounds": rounds + 1,
                                        "questions": questions, "analysis": analysis}
         st.session_state["_pending_cases"] = None
         return ClarifyReply(_clarify_text(questions, lang), questions)
 
     st.session_state.intent_ctx = None
     return _answer(query, analysis, persona, lang, history,
-                   unanswered=questions if needs else [])
+                   unanswered=questions if needs else [], search=search)
 
 
 def _answer(query: str, analysis: dict, persona: str, lang: str, history: list,
-            unanswered: list[dict] | None = None):
+            unanswered: list[dict] | None = None, search: str | None = None):
     """Retrieve + generate for a standalone *query*. *unanswered* clarifying
     questions switch the answer to the general format and are listed as the
-    information still needed."""
+    information still needed. *search* (default: query) is the retrieval text."""
     intent = analysis.get("intent") if analysis.get("intent") in INTENTS else heuristic_intent(query)
     laws = analysis.get("laws") or detect_laws(query)
-    terms = [x for x in (analysis.get("search_terms") or []) if isinstance(x, str)]
     missing = [q["q"] for q in (unanswered or [])]
     # Overtime pay is computed in code (overtime_calc.py): same facts, same numbers.
     ot = analysis.get("overtime") if isinstance(analysis.get("overtime"), dict) else {}
@@ -883,8 +918,8 @@ def _answer(query: str, analysis: dict, persona: str, lang: str, history: list,
                         monthly_wage=ot.get("monthly_wage"), hourly_wage=ot.get("hourly_wage")) if ot else None
     print(f"[INTENT] 分支: 回答 | intent={intent!r} laws={laws} general={bool(missing)} "
           f"calc={calc.total if calc else None}")
-    return query_rag_system(query, persona, lang, search_query_override=query,
-                            intent=intent, laws=laws, search_terms=terms,
+    return query_rag_system(query, persona, lang, search_query_override=search or query,
+                            intent=intent, laws=laws,
                             violation=analysis.get("violation"), history=history,
                             missing_fields=missing or None, general=bool(missing),
                             calc_note=calc.as_prompt() if calc else "")
@@ -926,9 +961,11 @@ def query_rag_system(
         corpora, result counts, whether cases enter the prompt, and the answer
         format — see intent_router.make_plan.
 
-    search_terms: statutory wording from _analyze_intent, appended to the law
-        search query (vector + BM25). Bridges colloquial questions to the
-        article text: Hit@5 73% → 77% mean (74-80% over 10 sampled runs) on the 台北 FAQ set (eval_retrieval.py).
+    search_terms: optional statutory wording appended to the law search query.
+        The app no longer passes it: LLM-generated terms raised law Hit@5 only
+        73% → 75% (73-79% over 10 runs, 84 台北 FAQ questions) but made the
+        retrieved — and cited — articles differ every time the same question
+        was asked. Kept for experiments (eval/eval_retrieval.py +terms column).
     history: earlier chat messages; the last few turns go into the answer
         call so follow-ups stay consistent (retrieval uses the rewritten
         standalone query from _analyze_intent instead).
@@ -1148,7 +1185,11 @@ def query_rag_system(
             f"prompt_chars={len(final_prompt)} "
             f"input_tok={_input_tok} output_tok={_output_tok} "
             f"scope={'OUT' if is_out else 'IN'} retries={_stats['retries']} stop={_stats['stop']} "
-            f"intent={plan.intent} laws={','.join(plan.laws)}"
+            f"intent={plan.intent} laws={','.join(plan.laws)} "
+            # Which articles went into the prompt, to tell retrieval variation
+            # apart from the model's own choice of what to cite.
+            f"arts={','.join(_short_art(m) for _, m, _ in l_results)} "
+            f"pen={','.join(_short_art(m) for _, m in pen_results)}"
         )
 
         if _stats["stop"] == "max_tokens":

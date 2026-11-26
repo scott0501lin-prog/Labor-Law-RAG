@@ -55,7 +55,6 @@ INTENT_ANALYSIS_PROMPT = """\
   "is_followup": true 或 false,
   "intent": "solve_problem 或 find_cases 或 law_lookup 或 out_of_scope",
   "laws": ["相關法規，依關聯度排序，只能從：勞動基準法、勞動基準法施行細則、勞工退休金條例、勞工職業災害保險及保護法、最低工資法、勞工請假規則"],
-  "search_terms": ["3 到 6 個法規條文會使用的詞語，用來檢索法條"],
   "violation": true 或 false,
   "overtime": {{"day_type": "平日／休息日／國定假日／例假日 或 null", "hours": 數字或 null,
                "monthly_wage": 數字或 null, "hourly_wage": 數字或 null}} 或 null,
@@ -77,7 +76,7 @@ INTENT_ANALYSIS_PROMPT = """\
       → 只補上前文的情境（「女性勞工夜間工作」），問句其餘部分保持原樣。
   - 原文非繁體中文時一併翻譯成繁體中文。
 - is_followup：translated_query 有用到先前對話的內容時為 true（包括回答助理的反問），否則 false
-- intent、laws、search_terms、violation、clarify 都以改寫後的完整問題判斷。
+- intent、laws、violation、overtime、clarify 都以改寫後的完整問題判斷。
 - intent 定義：
   - solve_problem：描述自己的處境，想知道權益或怎麼處理（勞資爭議諮詢）
   - find_cases：想看案例、判決、函釋、問答或實際處理情形（例：「資遣的判決」「加班費的函釋」）
@@ -88,11 +87,6 @@ INTENT_ANALYSIS_PROMPT = """\
 - laws：退休金提繳與個人專戶把「勞工退休金條例」排第一；職災保險給付把「勞工職業災害保險及保護法」排第一；
   最低工資把「最低工資法」排第一；婚喪病事公假把「勞工請假規則」排第一；其餘勞動條件把「勞動基準法」排第一；
   問施行細則才把施行細則排第一。out_of_scope 時給空陣列
-- search_terms：把口語問題換成法規條文裡的用字，涵蓋判斷這個問題需要的法律概念，
-  不只是問題表面的字（例：「懷孕了公司還排我上夜班」→ 女工、妊娠期間、午後十時至翌晨六時、工作時間；
-  「週末被叫回公司值班」→ 休息日、例假、延長工作時間、工資加給；
-  「主管逼我簽自願離職」→ 終止勞動契約、資遣費、預告期間）。
-  不要寫條號。out_of_scope 時給空陣列
 - violation：問題涉及雇主（或投保單位）可能違反規定（例如不給加班費、未提繳退休金、
   未依法預告就解僱），或直接詢問罰則、罰鍰、檢舉時為 true；單純詢問制度內容或計算方式為 false
 - overtime：只有在使用者想知道自己某次加班可以拿多少加班費時填寫（含先前對話提供的事實），其他問題給 null。

@@ -13,6 +13,11 @@ Output: eval/search_terms.json  {question: [[term, ...] per run]}
 Rerun (without --missing) after changing INTENT_ANALYSIS_PROMPT
 (Fronted/intent_config.py).
 
+No longer runnable as is: the app dropped search_terms from the intent
+prompt (they made the cited articles differ on every ask for +2 points of
+Hit@5). eval/search_terms.json keeps the 10 runs from the last prompt that
+produced them (commit 70d09c7); check that commit out to regenerate.
+
 Several runs because the terms are sampled (the API takes no temperature on
 current models): a single run's Hit@5 ranged 72%-80% on the same prompt, so
 eval_retrieval.py reports the mean and range over runs.
@@ -38,6 +43,9 @@ OUT = os.path.join(ROOT, "eval", "search_terms.json")
 
 
 def main():
+    if '"search_terms"' not in INTENT_ANALYSIS_PROMPT:
+        sys.exit("INTENT_ANALYSIS_PROMPT no longer asks for search_terms (removed from the app); "
+                 "eval/search_terms.json holds the cached runs from commit 70d09c7.")
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", type=int, default=5)
     ap.add_argument("--missing", action="store_true",
